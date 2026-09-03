@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-Endoscope viewer with a 3D pointing indicator
----------------------------------------------
-Fullscreen video from the AtomS3R-CAM probe with a compass-style indicator
-showing where the lens is aimed, for use where the probe is out of sight.
+Endoscope viewer with a 3D aim indicator
+----------------------------------------
+Fullscreen video from the AtomS3R-CAM probe plus a compass showing where the
+lens is aimed, for work where the probe is out of sight.
 
     python3 endoscope.py
     python3 endoscope.py --windowed        # for development on a desktop
@@ -11,27 +11,35 @@ showing where the lens is aimed, for use where the probe is out of sight.
 
 LAYOUT
     top-left      EXIT
-    top-right     3D orientation indicator
+    top-right     aim indicator
     bottom-right  ZERO
 
-HOW THE INDICATOR WORKS
-    The probe reports a quaternion, not Euler angles: an endoscope routinely
-    points straight down a hole, which is exactly where pitch/roll/yaw gimbal
-    lock and the indicator would flip.
+HOW THE INDICATOR READS
+    An azimuthal projection of the whole sphere onto a disc. The rim is
+    horizontal, the centre is vertical, and the top of the disc is the
+    direction you were facing when you zeroed.
 
-    Zeroing captures the current attitude as the reference. Everything drawn
-    afterwards is the probe's direction *relative to that reference*, so the
-    display never depends on which way the room faces -- only on how far the
-    probe has turned since you zeroed it.
+        distance from centre   how close to horizontal the lens is
+        angle around the disc  how far left or right of your zero heading
+        arrow size             elevation: it grows aiming up, shrinks aiming down
+        solid dot at centre    straight up
+        hollow ring at centre  straight down
 
-    Screen-up on the indicator is real-world up, taken from gravity, so the
-    picture stays meaningful even though heading itself has no absolute source.
+    Length alone cannot separate "aimed up" from "aimed down" -- both
+    foreshorten identically -- so the arrow scale carries that sign. Reading
+    the disc as though you were looking down on the probe from above, aiming
+    up brings the tip toward you and it draws larger.
+
+ELEVATION IS ABSOLUTE, HEADING IS RELATIVE
+    Elevation comes from gravity, so it never drifts and never needs zeroing.
+    Only the heading is measured against the zero reference, which is why the
+    ZERO button stays reachable during use: heading is the only channel that
+    can wander.
 
 WHY THERE IS A ZERO BUTTON AND NOT A MAGNETOMETER
     The BMM150 could give absolute heading, but this probe works around steel:
     engine bays, pipework, machinery. Magnetic heading there is worse than
-    gyro drift. Re-zeroing on demand is the honest fix, so the button stays
-    reachable during use rather than only at startup.
+    gyro drift.
 
 SETUP ON THE PI
     sudo apt install python3-serial python3-opencv python3-pil.imagetk -y
@@ -72,8 +80,8 @@ SYNC = b"\xa5\x5a"
 TYPE_IMU = 1
 TYPE_FRAME = 2
 
-# Which body axis the lens looks along. The probe can be mounted any way
-# round, so this is chosen once during setup and remembered.
+# Which body axis the lens looks along. The probe can be mounted any way round,
+# so this is chosen once during setup and remembered.
 AXES = [
     ("+X", (1.0, 0.0, 0.0)),
     ("-X", (-1.0, 0.0, 0.0)),
@@ -83,48 +91,30 @@ AXES = [
     ("-Z", (0.0, 0.0, -1.0)),
 ]
 
-TEXT = {
-    "exit": "EXIT", "zero": "ZERO", "axis": "AXIS",
-    "start": "ZERO AND START",
-    "title": "Zero before use",
-    "hint1": "Hold the probe level, lens facing the screen",
-    "hint2": "Keep it still, then press the button below",
-    "hint3": "If the preview below is not facing you, press AXIS first",
-    "notzero": "NOT ZEROED", "still": "re-calibrating",
-    "az": "AZ", "el": "EL", "screen": "SCREEN",
-}
+BG = "#06090b"
+PANEL = "#0b1114"
+EDGE = "#37474f"
+RING = "#3c4a52"
+GRID = "#2f6f7a"
+BODY = "#7ea8bd"
+BODY_EDGE = "#cfe4ef"
+LENS = "#0d0d0d"
+ARROW = ["#7d8a91", "#98a5ac", "#b4c1c8", "#d2dee4", "#f2f7fa"]
+DIM = "#78909c"
+MUTED = "#546e7a"
 
 
 # ------------------------------------------------------------- quaternions
 
-def q_mul(a, b):
-    aw, ax, ay, az = a
-    bw, bx, by, bz = b
-    return (
-        aw * bw - ax * bx - ay * by - az * bz,
-        aw * bx + ax * bw + ay * bz - az * by,
-        aw * by - ax * bz + ay * bw + az * bx,
-        aw * bz + ax * by - ay * bx + az * bw,
-    )
-
-
-def q_conj(q):
-    return (q[0], -q[1], -q[2], -q[3])
-
-
 def q_rotate(q, v):
-    """Rotate vector v by quaternion q."""
     w, x, y, z = q
     vx, vy, vz = v
-    # t = 2 * (q_vec x v);  result = v + w*t + q_vec x t
     tx = 2.0 * (y * vz - z * vy)
     ty = 2.0 * (z * vx - x * vz)
     tz = 2.0 * (x * vy - y * vx)
-    return (
-        vx + w * tx + (y * tz - z * ty),
-        vy + w * ty + (z * tx - x * tz),
-        vz + w * tz + (x * ty - y * tx),
-    )
+    return (vx + w * tx + (y * tz - z * ty),
+            vy + w * ty + (z * tx - x * tz),
+            vz + w * tz + (x * ty - y * tx))
 
 
 def v_norm(v):
@@ -134,14 +124,34 @@ def v_norm(v):
     return (v[0] / n, v[1] / n, v[2] / n)
 
 
-def v_cross(a, b):
-    return (a[1] * b[2] - a[2] * b[1],
-            a[2] * b[0] - a[0] * b[2],
-            a[0] * b[1] - a[1] * b[0])
+def clamp(x, lo=-1.0, hi=1.0):
+    return lo if x < lo else (hi if x > hi else x)
 
 
-def v_dot(a, b):
-    return a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
+def aim_angles(q_now, q_ref, axis_idx):
+    """
+    Return (azimuth, elevation) in radians.
+
+    Elevation is measured from gravity, so it is absolute and drift-free.
+    Azimuth is measured from the heading captured at zero time, positive to
+    the operator's right, because heading has no absolute reference available
+    in a steel environment.
+    """
+    fwd = AXES[axis_idx][1]
+    v = v_norm(q_rotate(q_now, fwd))
+    el = math.asin(clamp(v[2]))
+
+    if q_ref is None:
+        return 0.0, el
+
+    r = v_norm(q_rotate(q_ref, fwd))
+    # Signed angle from the reference heading to the current one, about world
+    # up. Negated so that turning right reads as positive on screen.
+    cross_z = r[0] * v[1] - r[1] * v[0]
+    dot = r[0] * v[0] + r[1] * v[1]
+    if abs(cross_z) < 1e-12 and abs(dot) < 1e-12:
+        return 0.0, el                      # aimed at the zenith: no heading
+    return -math.atan2(cross_z, dot), el
 
 
 # ------------------------------------------------------------- serial link
@@ -156,9 +166,9 @@ def find_port():
 
 class ProbeLink:
     """
-    Demultiplexes the probe's packet stream on a background thread and keeps
-    only the newest frame and the newest attitude. Nothing queues up: for a
-    live view, a late frame is worthless, so dropping is the correct policy.
+    Demultiplexes the probe's packet stream on a background thread, keeping
+    only the newest frame and attitude. Nothing queues: in a live view a late
+    frame is worthless, so dropping is the correct policy.
     """
 
     def __init__(self, port=None, baud=115200):
@@ -167,23 +177,21 @@ class ProbeLink:
         self.ser = None
         self.buf = bytearray()
         self.lock = threading.Lock()
-        self.frame = None            # BGR ndarray
+        self.frame = None
         self.frame_seq = 0
         self.quat = (1.0, 0.0, 0.0, 0.0)
         self.still = False
-        self.imu_seq = 0
         self.status = []
         self.bad_packets = 0
         self.running = False
-        self.error = None
-        self._fps_times = []
+        self._fps = []
 
     def start(self):
         if self.port is None:
             raise RuntimeError("No probe found. Check the USB-C cable carries "
                                "data, then run: ls /dev/ttyACM*")
         self.ser = serial.Serial(self.port, self.baud, timeout=0.5)
-        time.sleep(2.0)              # the board reboots when the port opens
+        time.sleep(2.0)                 # the board reboots when the port opens
         self.ser.reset_input_buffer()
         self.running = True
         threading.Thread(target=self._loop, daemon=True).start()
@@ -200,15 +208,15 @@ class ProbeLink:
 
     def video_fps(self):
         now = time.time()
-        self._fps_times = [t for t in self._fps_times if now - t < 2.0]
-        return len(self._fps_times) / 2.0
+        self._fps = [t for t in self._fps if now - t < 2.0]
+        return len(self._fps) / 2.0
 
     def _next_packet(self):
         while True:
             idx = self.buf.find(SYNC)
             if idx < 0:
                 if len(self.buf) > 1:
-                    del self.buf[:-1]        # sync word may straddle reads
+                    del self.buf[:-1]       # sync word may straddle two reads
                 return None
             if idx > 0:
                 del self.buf[:idx]
@@ -217,7 +225,7 @@ class ProbeLink:
 
             ptype = self.buf[2]
             length = int.from_bytes(self.buf[3:7], "little")
-            if length > 512 * 1024:          # implausible -> resynced wrongly
+            if length > 512 * 1024:         # implausible -> resynced wrongly
                 del self.buf[:2]
                 self.bad_packets += 1
                 continue
@@ -241,8 +249,7 @@ class ProbeLink:
         while self.running:
             try:
                 chunk = self.ser.read(self.ser.in_waiting or 1)
-            except Exception as e:
-                self.error = str(e)
+            except Exception:
                 self.running = False
                 return
             if chunk:
@@ -265,9 +272,8 @@ class ProbeLink:
                     q = data.get("q")
                     if q and len(q) == 4:
                         with self.lock:
-                            self.quat = (q[0], q[1], q[2], q[3])
+                            self.quat = tuple(q)
                             self.still = bool(data.get("st"))
-                            self.imu_seq += 1
 
                 elif ptype == TYPE_FRAME:
                     arr = np.frombuffer(payload, dtype=np.uint8)
@@ -276,7 +282,7 @@ class ProbeLink:
                         with self.lock:
                             self.frame = img
                             self.frame_seq += 1
-                        self._fps_times.append(time.time())
+                        self._fps.append(time.time())
 
     def snapshot(self):
         with self.lock:
@@ -287,162 +293,166 @@ class ProbeLink:
 
 class Indicator:
     """
-    Draws the probe as a slim body with a black lens block and a pale arrow
-    ahead of it, oriented in 3D from a fixed centre like a compass needle.
+    Azimuthal projection of the aim direction onto a disc.
 
-    Perspective is deliberate rather than decorative: when the probe aims at
-    you the shape foreshortens to almost nothing, and when it aims away it
-    stretches out. That difference is the only cue that separates "towards"
-    from "away", which a flat 2D compass cannot show at all.
+    Radius carries the horizontal component, so both straight up and straight
+    down collapse to the centre. What separates them is the arrow: it scales
+    with elevation, large aiming up and small aiming down, as though the disc
+    were being viewed from above with the tip swinging toward or away from you.
     """
 
-    def __init__(self, canvas, cx, cy, radius, strings):
+    def __init__(self, canvas, cx, cy, radius):
         self.c = canvas
-        self.cx, self.cy, self.R = cx, cy, radius
-        self.s = strings
-        self.depth = 3.2                      # eye distance, in radius units
+        self.cx, self.cy = cx, cy
+        self.R = radius                 # rim = horizontal
         self.items = []
+        self.frame_items = []
 
-    def _proj(self, p):
-        f = self.depth / max(self.depth - p[2], 0.25)
-        return (self.cx + p[0] * self.R * f,
-                self.cy - p[1] * self.R * f)
+    def move(self, cx, cy, radius):
+        self.cx, self.cy, self.R = cx, cy, radius
 
     def clear(self):
         for i in self.items:
             self.c.delete(i)
         self.items = []
 
-    def _poly(self, pts3, **kw):
-        flat = []
-        for p in pts3:
-            x, y = self._proj(p)
-            flat += [x, y]
-        self.items.append(self.c.create_polygon(*flat, **kw))
+    def clear_all(self):
+        self.clear()
+        for i in self.frame_items:
+            self.c.delete(i)
+        self.frame_items = []
 
-    def draw(self, direction, up_disp, zeroed):
-        """direction and up_disp are unit vectors in display coordinates."""
+    def draw_frame(self):
+        """Rings and cross-hair. Drawn once; the needle redraws on top."""
+        for i in self.frame_items:
+            self.c.delete(i)
+        self.frame_items = []
+        c, R = self.c, self.R
+        outer = R * 1.30
+        for rad, col, w in ((outer, RING, 1.6), (R, RING, 1.2)):
+            self.frame_items.append(c.create_oval(
+                self.cx - rad, self.cy - rad, self.cx + rad, self.cy + rad,
+                outline=col, width=w))
+        self.frame_items.append(c.create_line(
+            self.cx - outer, self.cy, self.cx + outer, self.cy,
+            fill=GRID, width=1))
+        self.frame_items.append(c.create_line(
+            self.cx, self.cy - outer, self.cx, self.cy + outer,
+            fill=GRID, width=1))
+
+    def draw(self, az, el):
         self.clear()
         c, R = self.c, self.R
 
-        # Outer boundary and centre.
-        self.items.append(c.create_oval(self.cx - R, self.cy - R,
-                                        self.cx + R, self.cy + R,
-                                        outline="#3c4a52", width=2))
-
-        # Ring lying in the real-world horizontal plane: the tilt of this
-        # ellipse tells you how the probe is inclined relative to level.
-        h1 = v_cross(up_disp, (0.0, 0.0, 1.0))
-        if math.sqrt(v_dot(h1, h1)) < 1e-3:
-            h1 = v_cross(up_disp, (1.0, 0.0, 0.0))
-        h1 = v_norm(h1)
-        h2 = v_norm(v_cross(up_disp, h1))
-        ring = []
-        for k in range(37):
-            a = 2 * math.pi * k / 36
-            w = (0.82 * (math.cos(a) * h1[0] + math.sin(a) * h2[0]),
-                 0.82 * (math.cos(a) * h1[1] + math.sin(a) * h2[1]),
-                 0.82 * (math.cos(a) * h1[2] + math.sin(a) * h2[2]))
-            ring += list(self._proj(w))
-        self.items.append(c.create_line(*ring, fill="#2f6f7a", width=1,
-                                        smooth=True))
-
-        if not zeroed:
-            self.items.append(c.create_text(
-                self.cx, self.cy, text=self.s["notzero"],
-                fill="#ff8a65", font=("DejaVu Sans", max(9, R // 7))))
-            return
-
-        d = v_norm(direction)
-
-        # A ribbon that always faces the viewer stands in for a solid body:
-        # cheap to draw, and at these sizes indistinguishable from a box.
-        side = v_cross(d, (0.0, 0.0, 1.0))
-        if math.sqrt(v_dot(side, side)) < 1e-3:
-            side = v_cross(d, (0.0, 1.0, 0.0))
-        side = v_norm(side)
-
-        def at(t, off=0.0):
-            return (d[0] * t + side[0] * off,
-                    d[1] * t + side[1] * off,
-                    d[2] * t + side[2] * off)
-
-        away = d[2] < 0                      # pointing behind the screen
-        body_fill = "#4a5f6b" if away else "#7ea8bd"
-        body_line = "#2b3b44" if away else "#cfe4ef"
-
-        w = 0.085
-        self._poly([at(0.02, w), at(0.62, w), at(0.62, -w), at(0.02, -w)],
-                   fill=body_fill, outline=body_line, width=1)
-
-        # Black block = the lens end. Whichever end this is on is the end
-        # you are looking out of.
-        bw = 0.115
-        self._poly([at(0.62, bw), at(0.80, bw), at(0.80, -bw), at(0.62, -bw)],
-                   fill="#0d0d0d", outline="#000000", width=1)
-
-        # Pale arrow beyond the lens, drawn as nested slices so it reads as a
-        # gradient without needing an image layer.
-        tip = at(1.16)
-        grays = ["#7d8a91", "#98a5ac", "#b4c1c8", "#d2dee4", "#f2f7fa"]
-        n = len(grays)
-        for i, g in enumerate(grays):
-            t0 = 0.90 + (1.16 - 0.90) * (i / n)
-            aw = 0.20 * (1.0 - i / n)
-            self._poly([at(t0, aw), at(t0, -aw), tip], fill=g, outline="")
-
-        # Head-on marker: with no length left to see, the ring alone would be
-        # ambiguous, so mark the centre explicitly.
-        if abs(d[2]) > 0.985:
-            r = R * 0.10
+        # Near-vertical: nothing left to point with, so mark the centre.
+        if abs(el) > math.radians(80):
+            r = R * 0.13
+            up = el > 0
             self.items.append(c.create_oval(
                 self.cx - r, self.cy - r, self.cx + r, self.cy + r,
-                fill="#f2f7fa" if d[2] > 0 else "#2b3b44",
-                outline="#0d0d0d", width=2))
+                fill=BODY_EDGE if up else "",
+                outline=BODY_EDGE, width=2))
+            return
+
+        radial = R * math.cos(el)
+        ux, uy = math.sin(az), -math.cos(az)      # screen unit vector, up = 0
+        px, py = -uy, ux                          # perpendicular
+
+        # Elevation scale: 1.0 level, ~1.7 at +45, ~0.3 at -45.
+        s = clamp(1.0 + math.sin(el), 0.10, 2.0)
+
+        arrow_len = 0.22 * R * s
+        arrow_w = 0.13 * R * s
+        lens_w = 0.075 * R * max(0.5, 0.75 + 0.25 * s)
+        body_w = 0.050 * R * (0.65 + 0.35 * s)
+        b0 = 0.04 * R
+        gap = 0.008 * R                  # segments read as one object
+
+        def pt(t, off=0.0):
+            return (self.cx + ux * t + px * off, self.cy + uy * t + py * off)
+
+        def poly(pts, **kw):
+            flat = []
+            for p in pts:
+                flat += [p[0], p[1]]
+            self.items.append(c.create_polygon(*flat, **kw))
+
+        tip = radial
+        l1 = tip - arrow_len - gap       # back of the lens block
+
+        # Aiming steeply up leaves almost no radius for the shaft, so the lens
+        # block yields space to the body rather than swallowing it whole.
+        lens_len = min(0.09 * R * max(0.45, 0.8 * s), max(0.0, (l1 - b0) * 0.55))
+        l0 = l1 - lens_len
+
+        if l0 > b0:
+            poly([pt(b0, body_w), pt(l0 + gap, body_w),
+                  pt(l0 + gap, -body_w), pt(b0, -body_w)],
+                 fill=BODY, outline=BODY_EDGE, width=1)
+
+        if lens_len > 0.5:
+            # Pure black vanishes against the panel, so the block is outlined.
+            poly([pt(l0, lens_w), pt(l1, lens_w),
+                  pt(l1, -lens_w), pt(l0, -lens_w)],
+                 fill=LENS, outline=BODY_EDGE, width=1)
+
+        # Nested slices give the arrow a gradient without an image layer.
+        n = len(ARROW)
+        tip_pt = pt(tip)
+        for i, g in enumerate(ARROW):
+            t0 = a0 + arrow_len * (i / n)
+            w = arrow_w * (1.0 - i / n)
+            poly([pt(t0, w), pt(t0, -w), tip_pt], fill=g, outline="")
 
 
 # ------------------------------------------------------------- application
 
 class App:
+    STAGE_SETUP = 0      # instructions, no indicator yet
+    STAGE_CHECK = 1      # zeroed; verify before entering the live view
+    STAGE_RUN = 2
+
     def __init__(self, link, args):
         self.link = link
         self.args = args
         self.cfg = self.load_cfg()
         self.axis_idx = self.cfg.get("axis", 0)
         self.q_ref = None
+        self.stage = self.STAGE_SETUP
         self.last_seq = -1
-        self.running = True
+        self.photo = None
 
         self.root = tk.Tk()
         self.root.title("Endoscope")
-        self.root.configure(bg="black")
-        if not args.windowed:
+        self.root.configure(bg=BG)
+        if args.windowed:
+            self.root.geometry("1024x600")
+        else:
             self.root.attributes("-fullscreen", True)
             self.root.configure(cursor="none")
-        else:
-            self.root.geometry("1024x600")
         self.root.update_idletasks()
 
-        self.W = self.root.winfo_width() if args.windowed else self.root.winfo_screenwidth()
-        self.H = self.root.winfo_height() if args.windowed else self.root.winfo_screenheight()
+        self.W = (self.root.winfo_width() if args.windowed
+                  else self.root.winfo_screenwidth())
+        self.H = (self.root.winfo_height() if args.windowed
+                  else self.root.winfo_screenheight())
 
         self.pick_font()
-        self.s = TEXT
-
         self.canvas = tk.Canvas(self.root, width=self.W, height=self.H,
-                                bg="black", highlightthickness=0, bd=0)
+                                bg=BG, highlightthickness=0, bd=0)
         self.canvas.pack(fill="both", expand=True)
 
         self.video_item = self.canvas.create_image(self.W // 2, self.H // 2)
-        self.photo = None
-
-        self.build_hud()
-        self.build_zero_screen()
+        self.hud = []
+        self.stage_items = []
+        self.indicator = None
 
         self.root.bind("<Escape>", lambda e: self.quit())
         self.root.protocol("WM_DELETE_WINDOW", self.quit)
 
-    # ---- persistence
+        self.enter_setup()
+
+    # ---- config
 
     def load_cfg(self):
         try:
@@ -460,234 +470,273 @@ class App:
             pass
 
     def pick_font(self):
-        """Pick a clean sans face; the UI text is English either way."""
-        preferred = ("DejaVu Sans", "Liberation Sans", "Noto Sans", "Arial")
-        have = set(tkfont.families())
-        for name in preferred:
-            for fam in have:
-                if name.lower() == fam.lower():
-                    self.font_family = fam
-                    return
-        self.font_family = "TkDefaultFont"
+        have = {f.lower(): f for f in tkfont.families()}
+        for name in ("dejavu sans", "liberation sans", "noto sans", "arial"):
+            if name in have:
+                self.ff = have[name]
+                return
+        self.ff = "TkDefaultFont"
 
     def f(self, size, bold=False):
-        return (self.font_family, size, "bold") if bold else (self.font_family, size)
+        return (self.ff, size, "bold") if bold else (self.ff, size)
 
-    # ---- HUD
+    def text_w(self, s, size, bold=False):
+        return tkfont.Font(family=self.ff, size=size,
+                           weight="bold" if bold else "normal").measure(s)
 
-    def button(self, x, y, w, h, label, fill, cb, size=None):
-        size = size or max(11, h // 3)
-        r = self.canvas.create_rectangle(x, y, x + w, y + h, fill=fill,
-                                         outline="", width=0)
-        t = self.canvas.create_text(x + w / 2, y + h / 2, text=label,
+    # ---- widgets
+
+    def button(self, cx, cy, label, fill, cb, size, pad_x=26, pad_y=15,
+               store=None, anchor="center"):
+        """Sized to its own text, so labels can never overlap each other."""
+        w = self.text_w(label, size, True) + pad_x * 2
+        h = size * 2 + pad_y * 2
+        if anchor == "center":
+            x0, y0 = cx - w / 2, cy - h / 2
+        elif anchor == "nw":
+            x0, y0 = cx, cy
+        elif anchor == "ne":
+            x0, y0 = cx - w, cy
+        elif anchor == "se":
+            x0, y0 = cx - w, cy - h
+        else:
+            x0, y0 = cx, cy - h
+        r = self.canvas.create_rectangle(x0, y0, x0 + w, y0 + h,
+                                         fill=fill, outline="", width=0)
+        t = self.canvas.create_text(x0 + w / 2, y0 + h / 2, text=label,
                                     fill="white", font=self.f(size, True))
         for item in (r, t):
             self.canvas.tag_bind(item, "<Button-1>", lambda e: cb())
-        return r, t
+        if store is not None:
+            store.extend([r, t])
+        return r, t, w, h
 
-    def build_hud(self):
-        pad = max(8, self.H // 50)
-        bw = max(90, self.W // 9)
-        bh = max(46, self.H // 11)
+    def clear_stage(self):
+        for i in self.stage_items:
+            self.canvas.delete(i)
+        self.stage_items = []
+        if self.indicator:
+            self.indicator.clear_all()
+            self.indicator = None
 
+    def clear_hud(self):
+        for i in self.hud:
+            self.canvas.delete(i)
         self.hud = []
-        self.hud += list(self.button(pad, pad, bw, bh, "✕ " + self.s["exit"],
-                                     "#c62828", self.quit))
-        self.hud += list(self.button(self.W - bw - pad, self.H - bh - pad,
-                                     bw, bh, self.s["zero"], "#1565c0",
-                                     self.zero_now))
 
-        panel = int(min(self.W, self.H) * 0.34)
-        px = self.W - panel - pad
-        py = pad
-        self.hud.append(self.canvas.create_rectangle(
-            px, py, px + panel, py + panel, fill="#0b1114", outline="#37474f",
-            width=2))
+    # ---- stage 1: instructions, indicator deliberately absent
 
-        self.indicator = Indicator(self.canvas, px + panel / 2,
-                                   py + panel / 2 - panel * 0.04,
-                                   panel * 0.36, self.s)
-        self.readout = self.canvas.create_text(
-            px + panel / 2, py + panel - max(12, panel // 12),
-            text="", fill="#90a4ae", font=self.f(max(9, panel // 18)))
-        self.hud.append(self.readout)
+    def enter_setup(self):
+        self.clear_stage()
+        self.clear_hud()
+        self.stage = self.STAGE_SETUP
+        self.canvas.itemconfigure(self.video_item, image="")
+        c, W, H = self.canvas, self.W, self.H
+        z = self.stage_items
 
-        self.statusbar = self.canvas.create_text(
-            pad, self.H - pad, anchor="sw", text="", fill="#607d8b",
-            font=self.f(max(9, self.H // 60)))
-        self.hud.append(self.statusbar)
+        big = max(17, int(H / 17))
+        mid = max(11, int(H / 34))
+        small = max(9, int(H / 44))
 
-    # ---- zeroing screen
+        z.append(c.create_text(W / 2, H * 0.11, text="ZERO BEFORE USE",
+                               fill="#ffffff", font=self.f(big, True)))
+        z.append(c.create_text(
+            W / 2, H * 0.215,
+            text="Aim the lens straight ahead \u2014 the way you are facing",
+            fill="#b0bec5", font=self.f(mid)))
+        z.append(c.create_text(
+            W / 2, H * 0.275,
+            text="Hold it level and still, then press ZERO",
+            fill="#b0bec5", font=self.f(mid)))
 
-    def build_zero_screen(self):
-        self.zero_items = []
-        z = self.zero_items
-        c = self.canvas
-
-        z.append(c.create_rectangle(0, 0, self.W, self.H, fill="#06090b",
-                                    outline=""))
-        z.append(c.create_text(self.W / 2, self.H * 0.10, text=self.s["title"],
-                               fill="#ffffff", font=self.f(max(16, self.H // 18), True)))
-        z.append(c.create_text(self.W / 2, self.H * 0.19, text=self.s["hint1"],
-                               fill="#b0bec5", font=self.f(max(11, self.H // 30))))
-        z.append(c.create_text(self.W / 2, self.H * 0.25, text=self.s["hint2"],
-                               fill="#b0bec5", font=self.f(max(11, self.H // 30))))
-
-        # Schematic: probe on the left aimed at a screen on the right.
-        cy = self.H * 0.40
-        x0 = self.W * 0.30
-        x1 = self.W * 0.66
-        z.append(c.create_rectangle(x1, cy - self.H * 0.07,
-                                    x1 + self.W * 0.07, cy + self.H * 0.07,
-                                    outline="#546e7a", width=3))
-        z.append(c.create_text(x1 + self.W * 0.035, cy + self.H * 0.11,
-                               text=self.s["screen"], fill="#546e7a",
-                               font=self.f(max(9, self.H // 45))))
-        z.append(c.create_rectangle(x0 - self.W * 0.09, cy - self.H * 0.018,
-                                    x0, cy + self.H * 0.018,
-                                    fill="#7ea8bd", outline=""))
-        z.append(c.create_rectangle(x0, cy - self.H * 0.025,
-                                    x0 + self.W * 0.02, cy + self.H * 0.025,
-                                    fill="#0d0d0d", outline=""))
-        z.append(c.create_line(x0 + self.W * 0.03, cy, x1 - self.W * 0.02, cy,
+        # Diagram: viewed from above. The operator is at the bottom, the probe
+        # points away from them, which is what the indicator will call "up".
+        cx, cy = W / 2, H * 0.53
+        span = min(W * 0.22, H * 0.20)
+        z.append(c.create_text(cx, cy + span * 0.95, text="YOU",
+                               fill=MUTED, font=self.f(small, True)))
+        z.append(c.create_oval(cx - span * 0.07, cy + span * 0.55,
+                               cx + span * 0.07, cy + span * 0.69,
+                               outline=MUTED, width=2))
+        z.append(c.create_rectangle(cx - span * 0.30, cy + span * 0.18,
+                                    cx + span * 0.30, cy + span * 0.42,
+                                    outline=EDGE, width=2))
+        z.append(c.create_text(cx + span * 0.62, cy + span * 0.30,
+                               text="SCREEN", fill=MUTED,
+                               font=self.f(small), anchor="w"))
+        z.append(c.create_rectangle(cx - span * 0.055, cy - span * 0.18,
+                                    cx + span * 0.055, cy + span * 0.06,
+                                    fill=BODY, outline=BODY_EDGE))
+        z.append(c.create_rectangle(cx - span * 0.075, cy - span * 0.30,
+                                    cx + span * 0.075, cy - span * 0.18,
+                                    fill=LENS, outline=LENS))
+        z.append(c.create_line(cx, cy - span * 0.36, cx, cy - span * 0.86,
                                fill="#cfd8dc", width=3, arrow="last",
-                               arrowshape=(16, 20, 7)))
+                               arrowshape=(15, 19, 7)))
+        z.append(c.create_text(cx, cy - span * 1.00, text="FORWARD",
+                               fill="#cfd8dc", font=self.f(small, True)))
 
-        # Live preview so the axis can be confirmed before committing.
-        prev = int(min(self.W, self.H) * 0.30)
-        pxc = self.W / 2
-        pyc = self.H * 0.63
-        z.append(c.create_oval(pxc - prev / 2, pyc - prev / 2,
-                               pxc + prev / 2, pyc + prev / 2,
-                               outline="#263238", width=1))
-        self.preview = Indicator(c, pxc, pyc, prev * 0.36, self.s)
+        self.button(W / 2, H * 0.855, "ZERO", "#2e7d32", self.do_zero,
+                    max(15, int(H / 22)), store=z)
+        z.append(c.create_text(
+            W / 2, H * 0.955,
+            text="lens axis: " + AXES[self.axis_idx][0],
+            fill=MUTED, font=self.f(small)))
 
-        z.append(c.create_text(self.W / 2, self.H * 0.80, text=self.s["hint3"],
-                               fill="#78909c", font=self.f(max(9, self.H // 40))))
+    def do_zero(self):
+        _, _, q, _ = self.link.snapshot()
+        self.q_ref = q
+        self.enter_check()
 
-        bw = max(110, self.W // 7)
-        bh = max(48, self.H // 11)
-        z += list(self.button(self.W / 2 - bw - 12, self.H * 0.87, bw, bh,
-                              self.s["axis"] + "  " + AXES[self.axis_idx][0],
-                              "#455a64", self.cycle_axis))
-        self.axis_btn_text = z[-1]
-        z += list(self.button(self.W / 2 + 12, self.H * 0.87, bw, bh,
-                              self.s["start"], "#2e7d32", self.finish_zero))
+    # ---- stage 2: verify the zero before the video takes over
 
-        self.zeroing = True
+    def enter_check(self):
+        self.clear_stage()
+        self.stage = self.STAGE_CHECK
+        c, W, H = self.canvas, self.W, self.H
+        z = self.stage_items
+
+        big = max(15, int(H / 21))
+        small = max(9, int(H / 44))
+
+        z.append(c.create_text(W / 2, H * 0.085, text="CHECK THE ZERO",
+                               fill="#ffffff", font=self.f(big, True)))
+
+        disc = min(W, H) * 0.24
+        self.indicator = Indicator(c, W / 2, H * 0.44, disc)
+        self.indicator.draw_frame()
+
+        self.check_readout = c.create_text(
+            W / 2, H * 0.44 + disc * 1.55, text="",
+            fill=DIM, font=self.f(small))
+        z.append(self.check_readout)
+
+        z.append(c.create_text(
+            W / 2, H * 0.735,
+            text="Pointing forward it should read straight up.",
+            fill="#b0bec5", font=self.f(small)))
+        z.append(c.create_text(
+            W / 2, H * 0.785,
+            text="Tilt the lens up: the arrow grows.   Turn right: it swings right.",
+            fill=MUTED, font=self.f(small)))
+        z.append(c.create_text(
+            W / 2, H * 0.832,
+            text="If it moves the wrong way, press AXIS and zero again.",
+            fill=MUTED, font=self.f(small)))
+
+        bs = max(13, int(H / 26))
+        gap = max(14, int(W / 60))
+        labels = [("AXIS " + AXES[self.axis_idx][0], "#455a64", self.cycle_axis),
+                  ("RE-ZERO", "#1565c0", self.do_zero),
+                  ("START", "#2e7d32", self.enter_run)]
+        widths = [self.text_w(t, bs, True) + 52 for t, _, _ in labels]
+        total = sum(widths) + gap * (len(widths) - 1)
+        x = W / 2 - total / 2
+        self.axis_btn = None
+        for (label, col, cb), w in zip(labels, widths):
+            r, t, _, _ = self.button(x + w / 2, H * 0.925, label, col, cb, bs,
+                                     store=z)
+            if label.startswith("AXIS"):
+                self.axis_btn = t
+            x += w + gap
 
     def cycle_axis(self):
         self.axis_idx = (self.axis_idx + 1) % len(AXES)
         self.save_cfg()
-        self.canvas.itemconfigure(
-            self.axis_btn_text,
-            text=self.s["axis"] + "  " + AXES[self.axis_idx][0])
-
-    def finish_zero(self):
+        # A new axis invalidates the old reference, so re-zero immediately.
         _, _, q, _ = self.link.snapshot()
         self.q_ref = q
-        self.zeroing = False
-        self.preview.clear()
-        for i in self.zero_items:
-            self.canvas.delete(i)
-        self.zero_items = []
+        self.enter_check()
 
-    def zero_now(self):
-        _, _, q, _ = self.link.snapshot()
-        self.q_ref = q
+    # ---- stage 3: live view
 
-    # ---- geometry
+    def enter_run(self):
+        self.clear_stage()
+        self.stage = self.STAGE_RUN
+        c, W, H = self.canvas, self.W, self.H
+        pad = max(10, H // 46)
+        bs = max(12, int(H / 30))
 
-    def display_vectors(self, q_now):
-        """
-        Express the probe's current aim, and real-world up, in a frame where
-        the zeroed aim points straight out of the screen.
-        """
-        fwd = AXES[self.axis_idx][1]
-        v_now = v_norm(q_rotate(q_now, fwd))
+        self.button(pad, pad, "\u2715  EXIT", "#c62828", self.quit, bs,
+                    store=self.hud, anchor="nw")
+        self.button(W - pad, H - pad, "ZERO", "#1565c0", self.do_zero, bs,
+                    store=self.hud, anchor="se")
 
-        if self.q_ref is None:
-            return v_now, (0.0, 1.0, 0.0)
+        panel = int(min(W, H) * 0.33)
+        px, py = W - panel - pad, pad
+        self.hud.append(c.create_rectangle(px, py, px + panel, py + panel,
+                                           fill=PANEL, outline=EDGE, width=2))
+        disc = panel * 0.33
+        self.indicator = Indicator(c, px + panel / 2,
+                                   py + panel * 0.46, disc)
+        self.indicator.draw_frame()
+        self.hud.extend(self.indicator.frame_items)
 
-        e3 = v_norm(q_rotate(self.q_ref, fwd))
-        world_up = (0.0, 0.0, 1.0)
-        e1 = v_cross(world_up, e3)
-        if math.sqrt(v_dot(e1, e1)) < 1e-3:      # aimed at the zenith/nadir
-            e1 = v_cross((1.0, 0.0, 0.0), e3)
-        e1 = v_norm(e1)
-        e2 = v_norm(v_cross(e3, e1))
+        self.readout = c.create_text(px + panel / 2, py + panel * 0.90,
+                                     text="", fill=DIM,
+                                     font=self.f(max(9, panel // 17)))
+        self.hud.append(self.readout)
+        self.statusbar = c.create_text(pad, H - pad, anchor="sw", text="",
+                                       fill=MUTED,
+                                       font=self.f(max(8, H // 62)))
+        self.hud.append(self.statusbar)
 
-        def to_disp(v):
-            return (v_dot(v, e1), v_dot(v, e2), v_dot(v, e3))
-
-        return to_disp(v_now), v_norm(to_disp(world_up))
-
-    # ---- main loop
+    # ---- loop
 
     def update(self):
-        if not self.running:
-            return
-
         frame, seq, q, still = self.link.snapshot()
+        az, el = aim_angles(q, self.q_ref, self.axis_idx)
 
-        if frame is not None and seq != self.last_seq and not self.zeroing:
-            self.last_seq = seq
-            h, w = frame.shape[:2]
-            scale = min(self.W / w, self.H / h)
-            resized = cv2.resize(frame, (int(w * scale), int(h * scale)),
-                                 interpolation=cv2.INTER_LINEAR)
-            rgb = cv2.cvtColor(resized, cv2.COLOR_BGR2RGB)
-            self.photo = ImageTk.PhotoImage(Image.fromarray(rgb))
-            self.canvas.itemconfigure(self.video_item, image=self.photo)
-            self.canvas.tag_lower(self.video_item)
+        if self.stage == self.STAGE_RUN:
+            if frame is not None and seq != self.last_seq:
+                self.last_seq = seq
+                h, w = frame.shape[:2]
+                scale = min(self.W / w, self.H / h)
+                small = cv2.resize(frame, (int(w * scale), int(h * scale)),
+                                   interpolation=cv2.INTER_LINEAR)
+                rgb = cv2.cvtColor(small, cv2.COLOR_BGR2RGB)
+                self.photo = ImageTk.PhotoImage(Image.fromarray(rgb))
+                self.canvas.itemconfigure(self.video_item, image=self.photo)
+                self.canvas.tag_lower(self.video_item)
+                for i in self.hud:
+                    self.canvas.tag_raise(i)
 
-        d, up = self.display_vectors(q)
-
-        if self.zeroing:
-            # Preview treats "now" as the reference so the operator can see
-            # whether the chosen axis really points at them.
-            fwd = AXES[self.axis_idx][1]
-            v = v_norm(q_rotate(q, fwd))
-            self.preview.draw(v if self.q_ref else self._preview_dir(v),
-                              (0.0, 1.0, 0.0), True)
-        else:
-            self.indicator.draw(d, up, self.q_ref is not None)
-            az = math.degrees(math.atan2(d[0], max(d[2], -1.0)))
-            el = math.degrees(math.asin(max(-1.0, min(1.0, d[1]))))
+            self.indicator.draw(az, el)
             self.canvas.itemconfigure(
                 self.readout,
-                text="{} {:+.0f}°   {} {:+.0f}°".format(
-                    self.s["az"], az, self.s["el"], el))
+                text="AZ {:+.0f}\u00b0   EL {:+.0f}\u00b0".format(
+                    math.degrees(az), math.degrees(el)))
             self.canvas.itemconfigure(
                 self.statusbar,
                 text="{:.0f} fps    {}".format(
                     self.link.video_fps(),
-                    self.s["still"] if still else ""))
+                    "re-calibrating" if still else ""))
+
+        elif self.stage == self.STAGE_CHECK:
+            self.indicator.draw(az, el)
+            self.canvas.itemconfigure(
+                self.check_readout,
+                text="AZ {:+.0f}\u00b0   EL {:+.0f}\u00b0".format(
+                    math.degrees(az), math.degrees(el)))
 
         self.root.after(40, self.update)
 
-    def _preview_dir(self, v):
-        """Before zeroing there is no reference, so show the raw body axis."""
-        return v
-
     def quit(self):
-        self.running = False
         try:
             self.root.destroy()
         except Exception:
             pass
 
     def run(self):
-        self.root.after(100, self.update)
+        self.root.after(120, self.update)
         self.root.mainloop()
 
 
 def main():
-    ap = argparse.ArgumentParser(description="Endoscope viewer with 3D aim indicator")
+    ap = argparse.ArgumentParser(description="Endoscope viewer with aim indicator")
     ap.add_argument("--port", help="e.g. /dev/ttyACM0 (auto-detected if omitted)")
     ap.add_argument("--baud", type=int, default=115200)
-    ap.add_argument("--windowed", action="store_true",
-                    help="run in a window instead of fullscreen")
+    ap.add_argument("--windowed", action="store_true")
     args = ap.parse_args()
 
     try:
