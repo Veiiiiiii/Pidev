@@ -224,6 +224,66 @@ def ref_elevation(q_ref, axis_idx):
     return math.asin(clamp(v[2]))
 
 
+# ---------------------------------------------------- lens-axis detection
+
+class AxisDetector:
+    """
+    Identify which body axis the lens looks along, from one gesture.
+
+    The zero pose fixes a contract: the lens is held level, so the true
+    forward axis starts horizontal (world z near 0). When the operator then
+    TILTS THE LENS UP, that axis -- and only that axis -- gains altitude.
+    Whichever roughly-horizontal candidate rises cleanly past TILT while the
+    runner-up stays near the floor is the lens axis. This replaces cycling
+    through six AXIS options by hand; the wrong-axis failure mode (twisting
+    the camera reads as up/down) can no longer be configured in by accident.
+
+    Limits, set by geometry rather than by implementation: a pure twist
+    about the lens raises a perpendicular axis with the exact same
+    signature, and a tilt DOWN raises the backward axis. Attitude alone
+    cannot tell those apart from the asked-for gesture, so the on-screen
+    instruction carries part of the job ("tilt UP, don't twist") and the
+    CHECK stage is the safety net -- a wrong lock exposes itself within
+    seconds (tilting then moves nothing, or turning right swings left) and
+    RE-ZERO restarts the detection. The MARGIN rule below does reject
+    mixed gestures, where twist and tilt are comparable.
+    """
+
+    TILT = 0.34        # sin(20 deg) of rise before a lock is considered
+    MARGIN = 2.0       # winner must lead the runner-up by this factor
+    HOLD = 8           # consecutive qualifying updates (~0.3 s at 25 Hz)
+
+    def __init__(self, q_ref):
+        self.base = [q_rotate(q_ref, a[1])[2] for a in AXES]
+        # The lens was level at zero, so it must be one of the axes that
+        # started horizontal; the near-vertical pair can never be it.
+        self.cands = [i for i, b in enumerate(self.base) if abs(b) < 0.5]
+        self.hits = 0
+        self.last = None
+
+    def step(self, q):
+        """Feed one attitude sample; returns a locked axis index or None."""
+        if not self.cands:
+            return None
+        best_i, best, second = -1, -2.0, -2.0
+        for i in self.cands:
+            s = q_rotate(q, AXES[i][1])[2] - self.base[i]
+            if s > best:
+                best_i, second, best = i, best, s
+            elif s > second:
+                second = s
+        clean = best > self.TILT and (second <= 0.0
+                                      or best > self.MARGIN * second)
+        if clean and best_i == self.last:
+            self.hits += 1
+            if self.hits >= self.HOLD:
+                return best_i
+        else:
+            self.hits = 1 if clean else 0
+            self.last = best_i if clean else None
+        return None
+
+
 # ------------------------------------------------------------- serial link
 
 def find_port(preferred=None):
@@ -488,8 +548,15 @@ class SimLink:
 
     def _pose(self, t):
         # Heading wanders +/-50 deg; pitch breathes +/-30 deg; roll stays 0.
+        # Between t=4s and t=7s the "operator" performs the CHECK gesture:
+        # a deliberate 50-degree tilt-up, so the axis auto-detection runs
+        # end-to-end in --sim exactly as it would on hardware.
         yaw = math.radians(50.0 * math.sin(2 * math.pi * t / 24.0))
-        pitch = math.radians(30.0 * math.sin(2 * math.pi * t / 9.0))
+        pitch = 30.0 * math.sin(2 * math.pi * t / 9.0)
+        if 4.0 < t < 7.0:
+            g = min((t - 4.0) / 1.0, 1.0, (7.0 - t) / 1.0)
+            pitch = pitch * (1.0 - g) + 50.0 * g
+        pitch = math.radians(pitch)
         qz = (math.cos(yaw / 2), 0.0, 0.0, math.sin(yaw / 2))
         qy = (math.cos(pitch / 2), 0.0, -math.sin(pitch / 2), 0.0)
         return q_mul(qz, qy)            # lens along +X, nose-up positive
@@ -690,6 +757,10 @@ class App:
         self.zero_gen = -1              # link generation the zero belongs to
         self.zero_time = 0.0
         self.peak_az = 0.0
+        self.axis_det = None            # armed by capture_zero
+        self.axis_auto = False          # True: the tilt-up gesture may relock
+        self.axis_btn_text = None       # CHECK's AXIS button label item
+        self.check_hint = None          # CHECK's first guidance line
         self.stage = self.STAGE_SETUP
         self.last_seq = -1
         self.photo = None
@@ -902,6 +973,7 @@ class App:
         self.zero_gen = self.link.health()["generation"]
         self.zero_time = time.monotonic()
         self.peak_az = 0.0
+        self.axis_det = AxisDetector(q)
         return True
 
     # ---- stage 1: instructions, indicator deliberately absent
@@ -975,6 +1047,7 @@ class App:
     def do_zero(self):
         if not self.capture_zero():
             return
+        self.axis_auto = True           # the tilt-up move may (re)set the axis
         self.notice = ""
         self.set_stage(self.STAGE_CHECK)
 
@@ -1018,14 +1091,17 @@ class App:
         z.append(self.drift_line)
 
         y += tiny * 2 + H * 0.018
-        z.append(c.create_text(
+        self.check_hint = c.create_text(
             W / 2, y,
-            text="Tilt the lens up \u2014 the arrow grows.   Turn right \u2014 it swings right.",
-            fill="#b0bec5", font=self.f(tiny)))
+            text="TILT THE LENS UP \u2014 this finds the lens axis. "
+                 "Tilt, don't twist.",
+            fill="#b0bec5", font=self.f(tiny, True))
+        z.append(self.check_hint)
         y += tiny * 2 + H * 0.006
         z.append(c.create_text(
             W / 2, y,
-            text="Moves the wrong way? Press AXIS, then it re-zeros itself.",
+            text="Then turn right \u2014 the arrow must swing right.   "
+                 "Wrong? Press RE-ZERO and redo the move.",
             fill=MUTED, font=self.f(tiny)))
 
         if abs(ref_elevation(self.q_ref, self.axis_idx)) > math.radians(60):
@@ -1046,10 +1122,16 @@ class App:
         x = W / 2 - total / 2
         by = H - pad - (bs * 2 + 30) / 2
         for (label, col, cb), w in zip(labels, widths):
-            self.button(x + w / 2, by, label, col, cb, bs, store=z)
+            _, t, _, _ = self.button(x + w / 2, by, label, col, cb, bs,
+                                     store=z)
+            if cb == self.cycle_axis:
+                self.axis_btn_text = t
             x += w + gap
 
     def cycle_axis(self):
+        # A manual choice wins over the detector until the next ZERO/RE-ZERO,
+        # otherwise the next tilt would immediately override it.
+        self.axis_auto = False
         self.axis_idx = (self.axis_idx + 1) % len(AXES)
         self.save_cfg()
         # A new axis invalidates the old reference, so re-zero immediately.
@@ -1102,6 +1184,7 @@ class App:
         screen mid-inspection would only make the honest mitigation annoying.
         """
         if self.capture_zero():
+            self.axis_auto = False      # never switch the axis mid-inspection
             self.toast("ZEROED \u2713", OK)
 
     # ---- keyboard shortcuts (development convenience; the device is touch)
@@ -1169,6 +1252,32 @@ class App:
                                           fill="#2e7d32" if ready else MUTED)
 
         elif self.stage == self.STAGE_CHECK:
+            if self.axis_auto and self.axis_det is not None:
+                hit = self.axis_det.step(q)
+                if hit is not None:
+                    self.axis_auto = False
+                    if hit != self.axis_idx:
+                        self.axis_idx = hit
+                        self.save_cfg()
+                        # Heading is defined per-axis, so recompute this
+                        # frame's angles and restart the drift peak.
+                        az, el = aim_angles(q, self.q_ref, self.axis_idx)
+                        self.peak_az = 0.0
+                        self.toast("LENS AXIS AUTO-SET: "
+                                   + AXES[hit][0] + " \u2713", OK, ms=2400)
+                    else:
+                        self.toast("LENS AXIS CONFIRMED: "
+                                   + AXES[hit][0] + " \u2713", OK, ms=2400)
+                    if self.axis_btn_text:
+                        self.canvas.itemconfigure(
+                            self.axis_btn_text,
+                            text="AXIS " + AXES[self.axis_idx][0])
+                    if self.check_hint:
+                        self.canvas.itemconfigure(
+                            self.check_hint,
+                            text="Axis " + AXES[self.axis_idx][0]
+                                 + " locked \u2713   Tilt up \u2014 arrow "
+                                   "grows.   Turn right \u2014 arrow right.")
             self.peak_az = max(self.peak_az, abs(math.degrees(az)))
             self.indicator.draw(az, el)
             self.canvas.itemconfigure(
