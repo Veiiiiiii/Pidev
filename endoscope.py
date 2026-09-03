@@ -230,44 +230,73 @@ class AxisDetector:
     """
     Identify which body axis the lens looks along, from one gesture.
 
-    The zero pose fixes a contract: the lens is held level, so the true
-    forward axis starts horizontal (world z near 0). When the operator then
-    TILTS THE LENS UP, that axis -- and only that axis -- gains altitude.
-    Whichever roughly-horizontal candidate rises cleanly past TILT while the
-    runner-up stays near the floor is the lens axis. This replaces cycling
-    through six AXIS options by hand; the wrong-axis failure mode (twisting
-    the camera reads as up/down) can no longer be configured in by accident.
+    Two phases. ARMING: wait until the probe is held still for about half a
+    second, then take THAT attitude as the baseline. Pressing ZERO involves
+    hand motion, and v3.1 armed instantly with the zero attitude as baseline:
+    a natural hand drop right after the press read as a 20-degree "tilt" and
+    locked the BACKWARD axis -- which shows up as up/down inverted while
+    left/right stays correct (field-observed 2026-09-03). Now nothing counts
+    until the hand settles, and the UI tells the operator when to move.
 
-    Limits, set by geometry rather than by implementation: a pure twist
-    about the lens raises a perpendicular axis with the exact same
-    signature, and a tilt DOWN raises the backward axis. Attitude alone
-    cannot tell those apart from the asked-for gesture, so the on-screen
-    instruction carries part of the job ("tilt UP, don't twist") and the
-    CHECK stage is the safety net -- a wrong lock exposes itself within
-    seconds (tilting then moves nothing, or turning right swings left) and
-    RE-ZERO restarts the detection. The MARGIN rule below does reject
-    mixed gestures, where twist and tilt are comparable.
+    DETECTION: from the still baseline, when the operator TILTS THE LENS UP,
+    the true forward axis -- and only it -- gains altitude. The first
+    candidate to rise cleanly past TILT (winner at least MARGIN times the
+    runner-up, held HOLD updates) is the lens axis. Because the lens was
+    level at zero, the near-vertical body axes are never candidates.
+
+    Rebasing also repairs the drop-then-lift sequence by itself: a probe that
+    sagged 25 degrees before settling simply gets a lower baseline, and the
+    lift back up still raises the true axis most.
+
+    Remaining limit, set by geometry: from stillness, a deliberate tilt DOWN
+    raises the backward axis with the same signature as a tilt up raises the
+    forward one, and a deliberate pure twist raises a perpendicular axis.
+    Attitude alone cannot tell those apart from the asked-for gesture, so the
+    instruction ("tilt UP, don't twist") carries that last step, the
+    right-turn check exposes a wrong lock within seconds, and RE-ZERO
+    restarts detection. Mixed twist+tilt is rejected by the margin rule.
     """
 
     TILT = 0.34        # sin(20 deg) of rise before a lock is considered
     MARGIN = 2.0       # winner must lead the runner-up by this factor
     HOLD = 8           # consecutive qualifying updates (~0.3 s at 25 Hz)
+    STILL_N = 12       # samples the pose must hold before arming (~0.5 s)
+    STILL_EPS = 0.06   # max altitude wander of any candidate while "still"
 
     def __init__(self, q_ref):
-        self.base = [q_rotate(q_ref, a[1])[2] for a in AXES]
+        zs = [q_rotate(q_ref, a[1])[2] for a in AXES]
         # The lens was level at zero, so it must be one of the axes that
         # started horizontal; the near-vertical pair can never be it.
-        self.cands = [i for i, b in enumerate(self.base) if abs(b) < 0.5]
+        self.cands = [i for i, b in enumerate(zs) if abs(b) < 0.5]
+        self.armed = False
+        self.base = None
+        self.win = []
         self.hits = 0
         self.last = None
+
+    def _zs(self, q):
+        return [q_rotate(q, AXES[i][1])[2] for i in self.cands]
 
     def step(self, q):
         """Feed one attitude sample; returns a locked axis index or None."""
         if not self.cands:
             return None
+        zs = self._zs(q)
+
+        if not self.armed:
+            self.win.append(zs)
+            if len(self.win) > self.STILL_N:
+                del self.win[0]
+            if len(self.win) == self.STILL_N:
+                spread = max(max(c) - min(c) for c in zip(*self.win))
+                if spread < self.STILL_EPS:
+                    self.armed = True
+                    self.base = zs          # rebase on the settled attitude
+            return None
+
         best_i, best, second = -1, -2.0, -2.0
-        for i in self.cands:
-            s = q_rotate(q, AXES[i][1])[2] - self.base[i]
+        for k, i in enumerate(self.cands):
+            s = zs[k] - self.base[k]
             if s > best:
                 best_i, second, best = i, best, s
             elif s > second:
@@ -328,6 +357,8 @@ class ProbeLink:
 
         self.state = "searching"        # searching / connecting / online / offline
         self.fw = ""                    # last firmware status string
+        self.fw_ver = None              # (major, rev) from the ready line
+        self.colour_mode = None         # probe's current colour mode, if told
         self.calibrating = False
         self.camera_failed = False
         self.generation = 0
@@ -336,6 +367,7 @@ class ProbeLink:
         self.status = []
         self.bad_packets = 0
         self._fps = []
+        self._wlock = threading.Lock()
         self.running = False
 
     # ---- lifecycle
@@ -367,7 +399,8 @@ class ProbeLink:
                 # expect boot-ROM text before our packets. The parser's sync
                 # scan skips it, so nothing is flushed -- flushing is how v2
                 # lost every startup status message.
-                self.ser = serial.Serial(port, self.baud, timeout=0.5)
+                self.ser = serial.Serial(port, self.baud, timeout=0.5,
+                                         write_timeout=0.3)
             except Exception:
                 self._set_state("offline")
                 time.sleep(1.5)
@@ -376,6 +409,8 @@ class ProbeLink:
             self.buf.clear()
             with self.lock:
                 self.generation += 1
+                self.fw_ver = None      # fresh boot: wait for its ready line
+                self.colour_mode = None
             self._set_state("online")
             self._read_until_error()
             try:
@@ -470,6 +505,22 @@ class ProbeLink:
                     self.frame_time = now
                     self._fps.append(now)
 
+    def send_byte(self, b):
+        """
+        One command byte to the probe (v3.2+ reads them; older firmware just
+        leaves them in its RX buffer, hence the write timeout). Returns
+        whether the byte was handed to the driver.
+        """
+        ser = self.ser
+        if ser is None:
+            return False
+        try:
+            with self._wlock:
+                ser.write(bytes([b]))
+            return True
+        except Exception:
+            return False
+
     def _handle_status(self, data):
         st = str(data.get("status", ""))
         with self.lock:
@@ -486,6 +537,21 @@ class ProbeLink:
                 self.calibrating = True
             elif st in ("calibrated", "calib_moved", "ready"):
                 self.calibrating = False
+                if st == "ready":
+                    try:
+                        v = data.get("v")
+                        self.fw_ver = ((int(v), int(data.get("r", 0)))
+                                       if v is not None else (0, 0))
+                    except (TypeError, ValueError):
+                        self.fw_ver = (0, 0)
+                    cm = data.get("cm")
+                    self.colour_mode = (int(cm) if isinstance(cm, (int, float))
+                                        else None)
+            elif st == "colour_mode":
+                try:
+                    self.colour_mode = int(data.get("mode", 0))
+                except (TypeError, ValueError):
+                    pass
 
     # ---- what the UI reads
 
@@ -500,6 +566,8 @@ class ProbeLink:
             return {
                 "state": self.state,
                 "fw": self.fw,
+                "fw_ver": self.fw_ver,
+                "colour_mode": self.colour_mode,
                 "calibrating": self.calibrating,
                 "camera_failed": self.camera_failed,
                 "generation": self.generation,
@@ -527,6 +595,8 @@ class SimLink:
         self.still = False
         self.state = "online"
         self.fw = "ready"
+        self.fw_ver = (3, 2)
+        self.colour_mode = 1
         self.calibrating = False
         self.camera_failed = False
         self.generation = 1
@@ -548,18 +618,30 @@ class SimLink:
 
     def _pose(self, t):
         # Heading wanders +/-50 deg; pitch breathes +/-30 deg; roll stays 0.
-        # Between t=4s and t=7s the "operator" performs the CHECK gesture:
-        # a deliberate 50-degree tilt-up, so the axis auto-detection runs
-        # end-to-end in --sim exactly as it would on hardware.
-        yaw = math.radians(50.0 * math.sin(2 * math.pi * t / 24.0))
-        pitch = 30.0 * math.sin(2 * math.pi * t / 9.0)
-        if 4.0 < t < 7.0:
-            g = min((t - 4.0) / 1.0, 1.0, (7.0 - t) / 1.0)
-            pitch = pitch * (1.0 - g) + 50.0 * g
+        # Scripted CHECK sequence, mirroring a real operator so the axis
+        # auto-detection runs end-to-end in --sim:
+        #   t 2.6..4.2   hold still, slightly nose-up (detector arms here)
+        #   t 4.2..7.2   deliberate tilt-up to 50 deg and back
+        yaw_t, pitch = t, 30.0 * math.sin(2 * math.pi * t / 9.0)
+        if 2.6 < t < 7.2:
+            yaw_t, pitch = 2.6, 10.0
+            if t > 4.2:
+                g = min((t - 4.2) / 1.2, 1.0, (7.2 - t) / 1.0)
+                pitch = 10.0 + 40.0 * max(g, 0.0)
+        yaw = math.radians(50.0 * math.sin(2 * math.pi * yaw_t / 24.0))
         pitch = math.radians(pitch)
         qz = (math.cos(yaw / 2), 0.0, 0.0, math.sin(yaw / 2))
         qy = (math.cos(pitch / 2), 0.0, -math.sin(pitch / 2), 0.0)
         return q_mul(qz, qy)            # lens along +X, nose-up positive
+
+    def send_byte(self, b):
+        if b in (ord("c"), ord("C")):
+            with self.lock:
+                self.colour_mode = (self.colour_mode + 1) % 3
+        elif b in (ord("0"), ord("1"), ord("2")):
+            with self.lock:
+                self.colour_mode = b - ord("0")
+        return True
 
     def _loop(self):
         frame_due = 0.0
@@ -592,6 +674,7 @@ class SimLink:
         now = time.monotonic()
         with self.lock:
             return {"state": "online", "fw": self.fw, "calibrating": False,
+                    "fw_ver": self.fw_ver, "colour_mode": self.colour_mode,
                     "camera_failed": False, "generation": self.generation,
                     "imu_age": now - self.imu_time if self.imu_time else 1e9,
                     "frame_age": now - self.frame_time if self.frame_time else 1e9,
@@ -761,6 +844,8 @@ class App:
         self.axis_auto = False          # True: the tilt-up gesture may relock
         self.axis_btn_text = None       # CHECK's AXIS button label item
         self.check_hint = None          # CHECK's first guidance line
+        self._hint_state = ""           # wait / armed / locked
+        self._last_cm = None            # last colour mode we toasted about
         self.stage = self.STAGE_SETUP
         self.last_seq = -1
         self.photo = None
@@ -1091,10 +1176,10 @@ class App:
         z.append(self.drift_line)
 
         y += tiny * 2 + H * 0.018
+        self._hint_state = "wait"
         self.check_hint = c.create_text(
             W / 2, y,
-            text="TILT THE LENS UP \u2014 this finds the lens axis. "
-                 "Tilt, don't twist.",
+            text="HOLD THE PROBE STILL for a moment \u2026",
             fill="#b0bec5", font=self.f(tiny, True))
         z.append(self.check_hint)
         y += tiny * 2 + H * 0.006
@@ -1152,6 +1237,9 @@ class App:
                     store=self.hud, anchor="nw")
         self.button(W - pad, H - pad, "ZERO", "#1565c0", self.zero_inplace,
                     bs, store=self.hud, anchor="se")
+        self.button(pad, H - pad - int(H * 0.055), "COLOR", "#455a64",
+                    self.cycle_colour, max(10, int(H / 38)),
+                    store=self.hud, anchor="sw")
 
         panel = int(min(W, H) * 0.33)
         px, py = W - panel - pad, pad
@@ -1177,6 +1265,24 @@ class App:
                                       state="hidden")
         self.hud.append(self.nosignal)
 
+    def cycle_colour(self):
+        """
+        Ask the probe for its next colour mode (0 raw / 1 byte-swap / 2 YUV).
+        A scrambled picture is fixed by pressing this until it looks natural:
+        the failure is in how the sensor's bytes are interpreted before JPEG,
+        so it can only be fixed probe-side, and cycling live beats reflashing
+        once per guess. The probe acknowledges with a status packet, which
+        pops the COLOUR MODE toast below.
+        """
+        h = self.link.health()
+        fv = h.get("fw_ver")
+        if fv is None or fv < (3, 2) or h.get("colour_mode") is None:
+            self.toast("PROBE FIRMWARE HAS NO COLOUR SWITCH \u2014 FLASH v3.2",
+                       WARN, ms=2600)
+            return
+        if not self.link.send_byte(ord("c")):
+            self.toast("PROBE NOT CONNECTED", WARN)
+
     def zero_inplace(self):
         """
         Re-zero without leaving the video. Heading drifts; the fix is one tap:
@@ -1200,6 +1306,8 @@ class App:
             self.cycle_axis()
         elif k == "s" and self.stage == self.STAGE_CHECK:
             self.start_run()
+        elif k == "c" and self.stage == self.STAGE_RUN:
+            self.cycle_colour()
 
     # ---- per-frame update
 
@@ -1222,6 +1330,16 @@ class App:
         if h["fw"] == "calib_moved":
             s += " \u2014 probe moved during calibration; keep it still a moment"
             return s, WARN
+        fv = h.get("fw_ver")
+        if fv == (0, 0):
+            # It answered "ready" without a version: pre-v3 firmware.
+            return s + " \u00b7 fw OLD \u2014 FLASH v3.2", WARN
+        if fv is not None:
+            s += " \u00b7 fw {}.{}".format(fv[0], fv[1])
+            if fv < (3, 2):
+                return s + " \u2014 flash v3.2 for the colour switch", WARN
+            if h.get("colour_mode") is not None:
+                s += " \u00b7 colour {}".format(h["colour_mode"])
         return s, OK
 
     def update(self):
@@ -1254,8 +1372,19 @@ class App:
         elif self.stage == self.STAGE_CHECK:
             if self.axis_auto and self.axis_det is not None:
                 hit = self.axis_det.step(q)
-                if hit is not None:
+                if hit is None:
+                    want = "armed" if self.axis_det.armed else "wait"
+                    if want != self._hint_state and self.check_hint:
+                        self._hint_state = want
+                        self.canvas.itemconfigure(
+                            self.check_hint,
+                            text=("NOW TILT THE LENS UP \u2014 this finds the "
+                                  "lens axis. Tilt, don't twist."
+                                  if want == "armed" else
+                                  "HOLD THE PROBE STILL for a moment \u2026"))
+                else:
                     self.axis_auto = False
+                    self._hint_state = "locked"
                     if hit != self.axis_idx:
                         self.axis_idx = hit
                         self.save_cfg()
@@ -1292,6 +1421,13 @@ class App:
                          int(dt) // 60, int(dt) % 60, self.peak_az))
 
         elif self.stage == self.STAGE_RUN:
+            cm = h.get("colour_mode")
+            if cm is not None and cm != self._last_cm:
+                prev, self._last_cm = self._last_cm, cm
+                if prev is not None:      # not the first report after boot
+                    names = {0: "RAW", 1: "BYTE-SWAP", 2: "YUV"}
+                    self.toast("COLOUR MODE {} \u2014 {}".format(
+                        cm, names.get(cm, "?")), OK, ms=1600)
             if frame is not None and seq != self.last_seq:
                 self.last_seq = seq
                 fh, fw = frame.shape[:2]
