@@ -84,26 +84,14 @@ AXES = [
 ]
 
 TEXT = {
-    "zh": {
-        "exit": "退出", "zero": "归零", "axis": "换轴",
-        "start": "归零并开始",
-        "title": "开始前请归零",
-        "hint1": "将内窥镜水平举起，镜头正对屏幕",
-        "hint2": "保持不动，然后按下方按钮",
-        "hint3": "若下方指示器没有正对你，先按「换轴」",
-        "notzero": "未归零", "still": "静止校正中",
-        "az": "方位", "el": "俯仰", "screen": "屏幕",
-    },
-    "en": {
-        "exit": "EXIT", "zero": "ZERO", "axis": "AXIS",
-        "start": "ZERO AND START",
-        "title": "Zero before use",
-        "hint1": "Hold the probe level, lens facing the screen",
-        "hint2": "Keep it still, then press the button below",
-        "hint3": "If the preview does not face you, press AXIS first",
-        "notzero": "NOT ZEROED", "still": "re-calibrating",
-        "az": "AZ", "el": "EL", "screen": "SCREEN",
-    },
+    "exit": "EXIT", "zero": "ZERO", "axis": "AXIS",
+    "start": "ZERO AND START",
+    "title": "Zero before use",
+    "hint1": "Hold the probe level, lens facing the screen",
+    "hint2": "Keep it still, then press the button below",
+    "hint3": "If the preview below is not facing you, press AXIS first",
+    "notzero": "NOT ZEROED", "still": "re-calibrating",
+    "az": "AZ", "el": "EL", "screen": "SCREEN",
 }
 
 
@@ -438,7 +426,8 @@ class App:
         self.W = self.root.winfo_width() if args.windowed else self.root.winfo_screenwidth()
         self.H = self.root.winfo_height() if args.windowed else self.root.winfo_screenheight()
 
-        self.s = TEXT["zh" if self.pick_font() else "en"]
+        self.pick_font()
+        self.s = TEXT
 
         self.canvas = tk.Canvas(self.root, width=self.W, height=self.H,
                                 bg="black", highlightthickness=0, bd=0)
@@ -471,17 +460,15 @@ class App:
             pass
 
     def pick_font(self):
-        """Use Chinese labels only if a font can actually render them."""
-        wanted = ("Noto Sans CJK SC", "Noto Sans CJK", "WenQuanYi Zen Hei",
-                  "WenQuanYi Micro Hei", "Source Han Sans", "Droid Sans Fallback")
+        """Pick a clean sans face; the UI text is English either way."""
+        preferred = ("DejaVu Sans", "Liberation Sans", "Noto Sans", "Arial")
         have = set(tkfont.families())
-        for name in wanted:
+        for name in preferred:
             for fam in have:
-                if name.lower() in fam.lower():
+                if name.lower() == fam.lower():
                     self.font_family = fam
-                    return True
-        self.font_family = "DejaVu Sans"
-        return False
+                    return
+        self.font_family = "TkDefaultFont"
 
     def f(self, size, bold=False):
         return (self.font_family, size, "bold") if bold else (self.font_family, size)
