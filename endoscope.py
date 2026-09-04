@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Endoscope viewer with a 3D aim indicator  (v3)
+Endoscope viewer with a 3D aim indicator  (v6.0.1)
 ----------------------------------------------
 Fullscreen video from the AtomS3R-CAM probe plus a compass showing where the
 lens is aimed, for work where the probe is out of sight.
@@ -9,10 +9,11 @@ lens is aimed, for work where the probe is out of sight.
     python3 endoscope.py --windowed         # development on a desktop
     python3 endoscope.py --sim --windowed   # no hardware at all: synthetic probe
     python3 endoscope.py --port /dev/ttyACM0
-    python3 endoscope.py --official         # stock M5 firmware: UVC + IMU WiFi
+    python3 endoscope.py --usb-composite    # v6.0.1: one USB-C cable, no Wi-Fi
+    python3 endoscope.py --official         # fallback: stock UVC + IMU WiFi
     python3 endoscope.py --log drift.csv    # record az/el vs time for analysis
 
-KEYS (besides the touch buttons): Z = zero, A = axis, S = start, Esc = exit.
+KEYS: Z = zero, A = axis, S = start, H = mirror, V = vertical flip, Esc = exit.
 
 LAYOUT
     top-left      EXIT (every stage -- a touchscreen has no Escape key)
@@ -71,7 +72,7 @@ WHAT v3 FIXES OVER v2 (v2 was written but never ran)
 
 SETUP ON THE PI
     sudo apt install python3-serial python3-opencv python3-pil.imagetk python3-numpy -y
-    sudo usermod -aG dialout $USER      # then REBOOT
+    sudo usermod -aG video,dialout $USER    # then REBOOT
 """
 import argparse
 import base64
@@ -82,10 +83,12 @@ import json
 import math
 import os
 import socket
+import subprocess
 import struct
 import sys
 import threading
 import time
+import zlib
 from urllib.parse import urlsplit
 
 try:
@@ -116,8 +119,19 @@ from PIL import Image, ImageTk
 
 CONFIG = os.path.join(os.path.expanduser("~"), ".config", "endoscope.json")
 SYNC = b"\xa5\x5a"
-APP_VER = "5.0"
-CONFIG_REV = 5
+APP_VER = "6.0.1"
+CONFIG_REV = 6
+
+# v6 binary telemetry is one fixed, checksummed record.  A fixed record is
+# cheaper to parse than JSON and, unlike newline framing, recovers cleanly if a
+# USB read begins in the middle of a packet.
+USB_IMU_MAGIC = b"IMU6"
+USB_IMU_VERSION = 1
+USB_IMU_PACKET = struct.Struct("<4sBBHIQ9f4fI")
+USB_IMU_FLAG_VALID = 1 << 0
+USB_IMU_FLAG_MAG_VALID = 1 << 1
+USB_IMU_FLAG_CALIBRATED = 1 << 2
+USB_IMU_FLAG_STATIONARY = 1 << 3
 
 TYPE_IMU = 1
 TYPE_FRAME = 2
@@ -154,10 +168,6 @@ ARROW = ["#7d8a91", "#98a5ac", "#b4c1c8", "#d2dee4", "#f2f7fa"]
 DIM = "#78909c"
 MUTED = "#546e7a"
 WARN = "#ffb300"
-# Flip buttons: filled accent when engaged, dark slate when off, so their
-# state reads from across a workshop without squinting at the label.
-FLIP_ON = "#26a69a"
-FLIP_OFF = "#37474f"
 ALERT = "#ef5350"
 OK = "#66bb6a"
 
@@ -559,8 +569,57 @@ def find_port(preferred=None):
     return None
 
 
+def find_usb_imu_port(preferred=None):
+    """Find the CDC interface of the v6 UVC+IMU composite device.
+
+    `/dev/serial/by-id` is stable across re-plugs, so it wins when available.
+    The sysfs text ranking is a fallback for minimal Raspberry Pi images that
+    do not install udev's persistent symlinks.  A user-supplied path always
+    wins; this is useful when several Atom cameras are connected.
+    """
+    if preferred:
+        return preferred if os.path.exists(preferred) else None
+
+    candidates = []
+    candidates.extend(sorted(glob.glob("/dev/serial/by-id/*AtomS3R*")))
+    candidates.extend(sorted(glob.glob("/dev/serial/by-id/*atom*")))
+    if candidates:
+        return candidates[0]
+
+    ranked = []
+    for pattern in ("/dev/ttyACM*", "/dev/ttyUSB*"):
+        for port in sorted(glob.glob(pattern)):
+            text = []
+            path = os.path.realpath("/sys/class/tty/{}/device".format(
+                os.path.basename(port)))
+            # USB strings may live on the interface node or a parent device.
+            for _ in range(7):
+                for name in ("product", "interface", "manufacturer"):
+                    try:
+                        with open(os.path.join(path, name), encoding="utf-8") as f:
+                            text.append(f.read().strip().lower())
+                    except OSError:
+                        pass
+                parent = os.path.dirname(path)
+                if parent == path:
+                    break
+                path = parent
+            joined = " ".join(text)
+            score = 0
+            if "atoms3r-cam imu" in joined:
+                score += 200
+            elif "atoms3r" in joined or "atom s3r" in joined:
+                score += 100
+            if port.startswith("/dev/ttyACM"):
+                score += 10
+            ranked.append((score, port))
+    if not ranked:
+        return None
+    return max(ranked, key=lambda item: (item[0], item[1]))[1]
+
+
 def find_video(preferred="auto"):
-    """Resolve a V4L2 node, preferring the AtomS3R-CAM by its kernel name."""
+    """Resolve the Atom capture node and reject metadata-only video nodes."""
     if preferred not in (None, "", "auto"):
         return int(preferred) if str(preferred).isdigit() else preferred
 
@@ -583,6 +642,25 @@ def find_video(preferred="auto"):
             score += 100
         if "uvc" in name or "camera" in name:
             score += 10
+        if "metadata" in name:
+            score -= 500
+
+        # UVC commonly exposes adjacent capture and metadata nodes. Prefer the
+        # node that actually advertises MJPEG instead of breaking a name tie by
+        # node number. install_pi.sh installs v4l2-ctl for this probe.
+        try:
+            probe = subprocess.run(
+                ["v4l2-ctl", "--device", node, "--list-formats-ext"],
+                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                text=True, timeout=2.0, check=False)
+            formats = probe.stdout.upper()
+            if "MJPG" in formats or "MJPEG" in formats:
+                score += 300
+            elif probe.returncode == 0:
+                score -= 100
+        except (OSError, subprocess.SubprocessError):
+            # Name-only ranking remains available on minimal systems.
+            pass
         ranked.append((score, node))
     return max(ranked, key=lambda item: (item[0], -int(item[1][10:])))[1]
 
@@ -604,6 +682,7 @@ class V4L2Source:
     """
 
     def __init__(self, index="auto", width=640, height=480):
+        self.requested_index = index
         self.index = index
         self.want = (width, height)
         self.cap = None
@@ -612,45 +691,105 @@ class V4L2Source:
         self.frame_seq = 0
         self.frame_time = 0.0
         self.running = False
+        self.online = False
         self.error = None
+        self.thread = None
+        self.reconnects = 0
         self._fps = []
 
-    def start(self):
-        src = find_video(self.index)
+    def _open_capture(self):
+        """Open/configure a V4L2 handle only from the reader thread."""
+        src = find_video(self.requested_index)
         if src is None:
-            raise RuntimeError("no /dev/video device found; flash the official "
-                               "AtomS3R-CAM UVC firmware and reconnect USB")
+            raise RuntimeError("no /dev/video device found; flash the v6 UVC+IMU "
+                               "firmware and reconnect USB")
         self.index = src
-        self.cap = cv2.VideoCapture(src, cv2.CAP_V4L2)
-        if not self.cap.isOpened():
+        cap = cv2.VideoCapture(src, cv2.CAP_V4L2)
+        if not cap.isOpened():
+            cap.release()
             raise RuntimeError("cannot open camera {}. Try: ls /dev/video*"
                                .format(self.index))
         # MJPG first: at 720p a YUYV stream will not fit down USB 2.0 at a
         # usable frame rate, and most UVC cameras offer both.
-        self.cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
-        self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.want[0])
-        self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.want[1])
-        self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-        ok, _ = self.cap.read()
-        if not ok:
-            raise RuntimeError("camera {} opened but returns no frames"
-                               .format(self.index))
+        cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.want[0])
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.want[1])
+        cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+        return cap
+
+    def start(self):
+        # VideoCapture creation, read and release all happen in this worker.
+        # Releasing from Tk while V4L2 is blocked in select() caused the
+        # observed OpenCV `alloc: invalid block` process abort.
+        if self.running:
+            return self
         self.running = True
-        threading.Thread(target=self._loop, daemon=True).start()
+        self.thread = threading.Thread(target=self._loop, daemon=True,
+                                       name="uvc-reader")
+        self.thread.start()
         return self
 
     def _loop(self):
-        while self.running:
-            ok, frame = self.cap.read()
-            if not ok:
-                time.sleep(0.05)
-                continue
-            now = time.monotonic()
-            with self.lock:
-                self.frame = frame
-                self.frame_seq += 1
-                self.frame_time = now
-                self._fps.append(now)
+        try:
+            while self.running:
+                if self.cap is None:
+                    try:
+                        self.cap = self._open_capture()
+                        self.error = None
+                    except Exception as exc:
+                        self.online = False
+                        self.error = str(exc)
+                        time.sleep(1.0)
+                        continue
+
+                try:
+                    ok, frame = self.cap.read()
+                except Exception as exc:
+                    # Some OpenCV builds raise instead of returning False on
+                    # USB removal. Treat both forms as the same recoverable
+                    # stream failure and keep all handle operations here.
+                    ok, frame = False, None
+                    self.error = "camera read failed: {}".format(exc)
+                if not self.running:
+                    break
+                if not ok:
+                    # A timed-out V4L2 handle is often no longer usable. The
+                    # same worker releases and reopens it, which is safe for
+                    # OpenCV and also recovers automatically after USB replug.
+                    self.online = False
+                    if self.error is None:
+                        self.error = ("camera read timeout; reopening {}"
+                                      .format(self.index))
+                    try:
+                        self.cap.release()
+                    except Exception:
+                        pass
+                    self.cap = None
+                    self.reconnects += 1
+                    # Never leave a frozen old frame looking like live video.
+                    with self.lock:
+                        self.frame = None
+                        self._fps = []
+                    time.sleep(0.5)
+                    continue
+
+                now = time.monotonic()
+                self.online = True
+                self.error = None
+                with self.lock:
+                    self.frame = frame
+                    self.frame_seq += 1
+                    self.frame_time = now
+                    self._fps.append(now)
+        finally:
+            # The reader is the sole VideoCapture owner, including shutdown.
+            if self.cap is not None:
+                try:
+                    self.cap.release()
+                except Exception:
+                    pass
+                self.cap = None
+            self.online = False
 
     def fps(self):
         now = time.monotonic()
@@ -664,9 +803,267 @@ class V4L2Source:
 
     def stop(self):
         self.running = False
-        time.sleep(0.05)
-        if self.cap:
-            self.cap.release()
+        if self.thread is not None:
+            # OpenCV's V4L2 select timeout is about ten seconds. Waiting only
+            # matters for a broken stream and prevents a cross-thread free.
+            self.thread.join(timeout=12.0)
+            if not self.thread.is_alive():
+                self.thread = None
+
+
+class UsbImuPacketParser:
+    """Incrementally recover validated v6 IMU packets from arbitrary chunks.
+
+    USB CDC does not preserve application write boundaries.  One read can hold
+    half a packet or several packets, and disconnect noise may precede the first
+    magic word.  The parser therefore scans for `IMU6`, validates version,
+    declared size, IEEE CRC-32 and quaternion sanity, then resumes at the next
+    record without ever trusting corrupt length data.
+    """
+
+    def __init__(self):
+        self.buf = bytearray()
+        self.bad_packets = 0
+
+    def feed(self, chunk):
+        self.buf.extend(chunk)
+        records = []
+        packet_len = USB_IMU_PACKET.size
+
+        while True:
+            start = self.buf.find(USB_IMU_MAGIC)
+            if start < 0:
+                # Keep the final three bytes because they may be the beginning
+                # of a magic word split across two serial reads.
+                if len(self.buf) > len(USB_IMU_MAGIC) - 1:
+                    del self.buf[:-(len(USB_IMU_MAGIC) - 1)]
+                break
+            if start:
+                del self.buf[:start]
+            if len(self.buf) < 8:
+                break
+
+            version = self.buf[4]
+            declared_len = struct.unpack_from("<H", self.buf, 6)[0]
+            if version != USB_IMU_VERSION or declared_len != packet_len:
+                del self.buf[0]
+                self.bad_packets += 1
+                continue
+            if len(self.buf) < packet_len:
+                break
+
+            raw = bytes(self.buf[:packet_len])
+            del self.buf[:packet_len]
+            fields = USB_IMU_PACKET.unpack(raw)
+            received_crc = fields[-1]
+            calculated_crc = zlib.crc32(raw[:-4]) & 0xffffffff
+            quaternion = tuple(float(v) for v in fields[15:19])
+            q_norm = math.sqrt(sum(v * v for v in quaternion))
+            if (received_crc != calculated_crc or
+                    not all(math.isfinite(v) for v in fields[6:19]) or
+                    not 0.5 < q_norm < 1.5):
+                self.bad_packets += 1
+                continue
+
+            # Normalising once more on the host contains float round-off and
+            # protects the UI from an imperfect future firmware implementation.
+            quaternion = tuple(v / q_norm for v in quaternion)
+            records.append({
+                "flags": fields[2],
+                "sequence": fields[4],
+                "timestamp_us": fields[5],
+                "accel_g": tuple(fields[6:9]),
+                "gyro_dps": tuple(fields[9:12]),
+                "mag_ut": tuple(fields[12:15]),
+                "quaternion": quaternion,
+            })
+        return records
+
+
+class UsbCompositeProbeLink:
+    """v6.0.1 transport: UVC pixels and fused IMU over one USB-C cable.
+
+    Linux binds the UVC interface to `/dev/video*` and the CDC ACM interface to
+    `/dev/ttyACM*`.  They are two interfaces of the same physical device, not
+    two cables or two networks.  The camera reader and serial reader each keep
+    only the newest sample, which bounds UI latency even after a slow frame.
+    """
+
+    is_uvc = True
+    is_usb_composite = True
+
+    def __init__(self, video="auto", width=640, height=480, port=None):
+        self.camera = V4L2Source(video, width, height)
+        self.want_port = port
+        self.port = None
+        self.ser = None
+        self.parser = UsbImuPacketParser()
+        self.lock = threading.Lock()
+        self.quat = (1.0, 0.0, 0.0, 0.0)
+        self.still = False
+        self.last_imu = None
+        self.last_sequence = None
+        self.dropped_packets = 0
+        self.state = "searching"
+        self.fw = "usb_uvc_cdc_v6"
+        self.fw_ver = (6, 0, 1)
+        self.calib_ok = None
+        self.calibrating = True
+        self.camera_failed = False
+        self.generation = 0
+        self.imu_time = 0.0
+        self.bad_packets = 0
+        self.running = False
+        self.status = []
+
+        # Compatibility fields keep the mature UI independent of transport.
+        self.raw_swap = False
+        self.raw_stream = False
+        self.test_pattern = False
+        self.colour_mode = None
+        self.sensor_preset = None
+        self.sensor_regs = ""
+        self.regs_seq = 0
+        self.reg_ack = None
+
+    def start(self):
+        # Camera discovery and re-open are asynchronous, so the UI can remain
+        # alive while the composite device is unplugged and reconnected.
+        self.camera.start()
+        self.running = True
+        threading.Thread(target=self._manager, daemon=True).start()
+        return self
+
+    def stop(self):
+        self.running = False
+        if self.ser is not None:
+            try:
+                self.ser.close()
+            except Exception:
+                pass
+        self.camera.stop()
+
+    def _manager(self):
+        while self.running:
+            port = find_usb_imu_port(self.want_port)
+            if port is None:
+                with self.lock:
+                    self.state = "searching"
+                time.sleep(1.0)
+                continue
+
+            with self.lock:
+                self.state = "connecting"
+            try:
+                # Baud is ignored by USB CDC but a conventional value keeps
+                # pyserial portable. DTR opens the firmware telemetry gate.
+                self.ser = serial.Serial(port, 115200, timeout=0.5,
+                                         write_timeout=0.3)
+                self.port = port
+                self.parser = UsbImuPacketParser()
+                self.last_sequence = None
+                first_packet = True
+                last_byte = time.monotonic()
+
+                while self.running:
+                    chunk = self.ser.read(self.ser.in_waiting or 1)
+                    if chunk:
+                        last_byte = time.monotonic()
+                        bad_before = self.parser.bad_packets
+                        records = self.parser.feed(chunk)
+                        self.bad_packets += self.parser.bad_packets - bad_before
+                        # Publishing only the newest decoded record explicitly
+                        # discards stale attitudes if scheduling was delayed.
+                        if records:
+                            record = records[-1]
+                            if first_packet:
+                                with self.lock:
+                                    self.generation += 1
+                                first_packet = False
+                            self._publish(record)
+                    elif time.monotonic() - last_byte > 3.0:
+                        raise TimeoutError("USB IMU telemetry timed out")
+            except Exception as exc:
+                if self.running:
+                    self.status.append({"status": "imu_retry", "error": str(exc)})
+                    del self.status[:-50]
+                with self.lock:
+                    self.state = "offline"
+            finally:
+                if self.ser is not None:
+                    try:
+                        self.ser.close()
+                    except Exception:
+                        pass
+                    self.ser = None
+            if self.running:
+                time.sleep(1.0)
+
+    def _publish(self, record):
+        sequence = record["sequence"]
+        if self.last_sequence is not None:
+            gap = (sequence - self.last_sequence - 1) & 0xffffffff
+            if 0 < gap < 100000:
+                self.dropped_packets += gap
+        self.last_sequence = sequence
+        flags = record["flags"]
+        now = time.monotonic()
+        with self.lock:
+            self.last_imu = record
+            self.quat = record["quaternion"]
+            self.still = bool(flags & USB_IMU_FLAG_STATIONARY)
+            self.calibrating = not bool(flags & USB_IMU_FLAG_CALIBRATED)
+            self.calib_ok = True if not self.calibrating else None
+            self.imu_time = now
+            self.state = "online" if flags & USB_IMU_FLAG_VALID else "connecting"
+
+    def snapshot(self):
+        frame, sequence, _ = self.camera.snapshot()
+        with self.lock:
+            return frame, sequence, self.quat, self.still
+
+    def health(self):
+        now = time.monotonic()
+        with self.lock:
+            return {
+                "state": self.state,
+                "fw": self.fw,
+                "fw_ver": self.fw_ver,
+                "colour_mode": None,
+                "sensor_preset": None,
+                "sensor_regs": "",
+                "regs_seq": 0,
+                "reg_ack": None,
+                "raw_stream": False,
+                "test_pattern": False,
+                "calib_ok": self.calib_ok,
+                "raw_seq": 0,
+                "calibrating": self.calibrating,
+                "camera_failed": not self.camera.online,
+                "generation": self.generation,
+                "imu_age": now - self.imu_time if self.imu_time else 1e9,
+                "frame_age": (now - self.camera.frame_time
+                              if self.camera.frame_time else 1e9),
+                "fps": self.camera.fps(),
+                "camera_error": self.camera.error,
+                "camera_reconnects": self.camera.reconnects,
+                "bad": self.bad_packets,
+                "dropped": self.dropped_packets,
+                "port": self.port,
+            }
+
+    # The v1 USB protocol is telemetry-only; UI legacy commands are disabled.
+    def send_bytes(self, _):
+        return False
+
+    def send_byte(self, _):
+        return False
+
+    def get_regs(self):
+        return {}, None
+
+    def take_raw(self):
+        return None, 0
 
 
 class ProbeLink:
@@ -686,10 +1083,6 @@ class ProbeLink:
     to know when to force a re-zero.
     """
 
-    #: Millisecond gap in the probe clock that counts as lost integration
-    #: time rather than ordinary jitter (50 Hz nominal = 20 ms per sample).
-    GAP_MS = 120
-
     def __init__(self, port=None, baud=115200):
         self.want_port = port
         self.baud = baud
@@ -697,13 +1090,6 @@ class ProbeLink:
         self.ser = None
         self.buf = bytearray()
         self.lock = threading.Lock()
-        # v6 link-quality counters, reported on the check screen and in the
-        # status line. imu_gap_ms is the total probe-clock time for which no
-        # attitude sample arrived; that is heading error already banked.
-        self.dev_time = None
-        self.imu_gaps = 0
-        self.imu_gap_ms = 0.0
-        self.worst_gap_ms = 0.0
 
         self.frame = None
         self.frame_seq = 0
@@ -733,14 +1119,6 @@ class ProbeLink:
         self.camera = None              # optional UVC source, overrides video
         self.test_pattern = False       # probe is sending synthetic bars
         self.calib_ok = None            # gyro calibration verdict, if told
-        # The firmware also reports the gyro spread it measured. That single
-        # number separates three unrelated faults that previously all printed
-        # the same "keep it still" advice:
-        #   spread < 0        the sensor never answered  -> IMU bus fault
-        #   3 .. ~50 deg/s    it really was moving       -> hold it still
-        #   ~150 deg/s        BMI270 post-config garbage -> power-cycle
-        self.calib_spread = None        # deg/s span seen during calibration
-        self.calib_attempt = None       # which of the 3 tries reported last
         self.raw = None                 # last raw frame for the DIAG grid
         self.raw_seq = 0
         self.calibrating = False
@@ -874,33 +1252,10 @@ class ProbeLink:
                 return
             q = data.get("q")
             if q and len(q) == 4:
-                # "t" is the probe's own millisecond clock at the moment the
-                # sample was integrated. It is the only trustworthy timeline:
-                # arrival time on the Pi includes USB scheduling and Python
-                # wake-up jitter. Gaps in it are the measurement that says
-                # whether heading can still be believed -- attitude is an
-                # INTEGRAL, so time the probe spent rotating while packets
-                # were missing is error that never comes back on its own.
-                dev_t = data.get("t")
                 with self.lock:
                     self.quat = tuple(q)
                     self.still = bool(data.get("st"))
                     self.imu_time = time.monotonic()
-                    if isinstance(dev_t, (int, float)):
-                        if self.dev_time is not None:
-                            gap_ms = dev_t - self.dev_time
-                            # 50 Hz nominal => 20 ms. Anything past 120 ms is
-                            # several lost samples, not ordinary jitter.
-                            if gap_ms > 120:
-                                self.imu_gaps += 1
-                                self.imu_gap_ms += gap_ms
-                                self.worst_gap_ms = max(self.worst_gap_ms,
-                                                        gap_ms)
-                            elif gap_ms < 0:
-                                # Probe rebooted: its clock restarted, so any
-                                # zero reference captured before is garbage.
-                                self.imu_gaps += 1
-                        self.dev_time = float(dev_t)
 
         elif ptype == TYPE_RAW:
             payload = bytes(payload)
@@ -976,12 +1331,6 @@ class ProbeLink:
                 self.calibrating = True
             elif st in ("calibrated", "calib_moved", "ready"):
                 self.calibrating = False
-                sp = data.get("spread")
-                if isinstance(sp, (int, float)):
-                    self.calib_spread = float(sp)
-                at = data.get("attempt")
-                if isinstance(at, (int, float)):
-                    self.calib_attempt = int(at)
                 if st == "ready":
                     try:
                         v = data.get("v")
@@ -1079,8 +1428,6 @@ class ProbeLink:
                 "raw_stream": self.raw_stream,
                 "test_pattern": self.test_pattern,
                 "calib_ok": self.calib_ok,
-                "calib_spread": self.calib_spread,
-                "calib_attempt": self.calib_attempt,
                 "raw_seq": self.raw_seq,
                 "calibrating": self.calibrating,
                 "camera_failed": self.camera_failed,
@@ -1092,11 +1439,6 @@ class ProbeLink:
                 "fps": (self.camera.fps() if self.camera is not None
                         else len(self._fps) / 2.0),
                 "bad": self.bad_packets,
-                # v6: lost integration time. Non-zero here is the honest
-                # reason a heading stopped matching reality.
-                "imu_gaps": self.imu_gaps,
-                "imu_gap_ms": self.imu_gap_ms,
-                "worst_gap_ms": self.worst_gap_ms,
                 "port": self.port,
             }
 
@@ -1434,16 +1776,14 @@ class OfficialProbeLink:
                     "regs_seq": 0, "reg_ack": None, "raw_stream": False,
                     "test_pattern": False, "calib_ok": self.calib_ok,
                     "raw_seq": 0, "calibrating": self.calibrating,
-                    "camera_failed": self.camera_failed,
+                    "camera_failed": not self.camera.online,
                     "generation": self.generation,
                     "imu_age": now - self.imu_time if self.imu_time else 1e9,
                     "frame_age": (now - self.camera.frame_time
                                   if self.camera.frame_time else 1e9),
                     "fps": self.camera.fps(), "bad": self.bad_packets,
-                    # The stock Wi-Fi route publishes no device clock, so gap
-                    # accounting is unavailable -- reported as -1 rather than
-                    # 0, which would falsely read as "no losses".
-                    "imu_gaps": -1, "imu_gap_ms": -1.0, "worst_gap_ms": -1.0,
+                    "camera_error": self.camera.error,
+                    "camera_reconnects": self.camera.reconnects,
                     "port": self.imu_url}
 
     def send_bytes(self, _):
@@ -1618,8 +1958,7 @@ class SimLink:
                     "frame_age": ((now - self.camera.frame_time)
                               if self.camera is not None and self.camera.frame_time
                               else (now - self.frame_time if self.frame_time else 1e9)),
-                    "fps": 12.5, "bad": 0, "port": "sim",
-                    "imu_gaps": 0, "imu_gap_ms": 0.0, "worst_gap_ms": 0.0}
+                    "fps": 12.5, "bad": 0, "port": "sim"}
 
 
 # ------------------------------------------------------------- indicator
@@ -1787,28 +2126,22 @@ class App:
         self.peak_az = 0.0
         self.axis_det = None            # armed by capture_zero
         self.axis_auto = False          # True: the tilt-up gesture may relock
+        self.axis_verified = False      # START stays locked until gesture/manual choice
         self.axis_btn_text = None       # CHECK's AXIS button label item
         self.check_hint = None          # CHECK's first guidance line
         self._hint_state = ""           # wait / armed / locked
         self._last_cm = None            # last colour mode we toasted about
         self.rot180 = bool(self.cfg.get("rot180", False))
-        # ---- operator display flips (v6) -------------------------------
-        # These mirror the PICTURE ONLY. They are applied at the very end of
-        # the render path, after every colour step and after rot180, and they
-        # are never fed back into aim_angles() or the indicator. The probe's
-        # body axes are a physical fact; letting a display button rotate them
-        # is exactly how v3.1 ended up saving a wrong axis. See HANDOFF S4.
-        self.flip_btn = {}          # {"flip_h": (rect_id, text_id), ...}
-        self.mirror_flag = None     # persistent "MIRRORED" HUD warning
-        self.flip_h = bool(self.cfg.get("flip_h", False))   # mirror left/right
-        self.flip_v = bool(self.cfg.get("flip_v", False))   # mirror up/down
+        # These two controls affect pixels only.  The IMU quaternion and lens
+        # axis are physical measurements and must not change when an operator
+        # mirrors the display for viewing convenience.
+        self.video_flip_h = bool(self.cfg.get("video_flip_h", False))
+        self.video_flip_v = bool(self.cfg.get("video_flip_v", False))
+        self.video_flip_h_btn = None
+        self.video_flip_v_btn = None
         # Up/down polarity, set once with FLIP U/D and never touched
         # by zeroing or by the axis detector.
-        # Default is INVERTED: on this build of the probe the lens axis the
-        # detector locks is the antipode of the true one, so a lift read as
-        # a drop until FLIP U/D was pressed every session. Baked in; the
-        # button stays so a differently-mounted probe can undo it.
-        self.el_sign = 1.0 if self.cfg.get("el_sign", -1) > 0 else -1.0
+        self.el_sign = 1.0 if self.cfg.get("el_sign", 1) > 0 else -1.0
         self.awb = bool(self.cfg.get("awb", False))
         self.tune_saved = (self.cfg.get("tune")
                            if args.legacy_colour_tools else None)
@@ -1917,21 +2250,16 @@ class App:
                 cfg = json.load(f)
             if int(cfg.get("config_rev", 0)) == CONFIG_REV:
                 return cfg
-            # v4.x persisted experimental sensor registers, colour matrices,
-            # grey-world AWB and a 180-degree compensation. Replaying those
-            # settings is enough to corrupt a now-correct official frame, so
-            # migrate only the proven orientation choices.
-            # NOTE: do NOT bump CONFIG_REV to add a key. New keys are read
-            # with .get(name, default), so an older config already works.
-            # Bumping the revision pushes a working config down this lossy
-            # migration branch, which silently discards the operator's colour
-            # calibration and TUNE registers. v6 did that by accident and it
-            # cost a bench session.
+            # Old releases persisted experimental colour overrides.  The v6
+            # UVC path needs none of them, so migrate only physical orientation
+            # choices and initialise the two new video-only flips to off.
             return {"config_rev": CONFIG_REV,
                     "axis": int(cfg.get("axis", 0)),
-                    "el_sign": float(cfg.get("el_sign", -1)),
-                    "rot180": False, "awb": False, "swap_rb": False,
-                    "flip_h": False, "flip_v": False}
+                    "el_sign": float(cfg.get("el_sign", 1)),
+                    "rot180": False,
+                    "video_flip_h": False,
+                    "video_flip_v": False,
+                    "awb": False, "swap_rb": False}
         except Exception:
             return {"config_rev": CONFIG_REV}
 
@@ -1942,8 +2270,8 @@ class App:
                 json.dump({"config_rev": CONFIG_REV,
                            "axis": self.axis_idx,
                            "rot180": self.rot180,
-                           "flip_h": self.flip_h,
-                           "flip_v": self.flip_v,
+                           "video_flip_h": self.video_flip_h,
+                           "video_flip_v": self.video_flip_v,
                            "el_sign": self.el_sign,
                            "awb": self.awb,
                            "swap_rb": self.swap_rb,
@@ -2076,6 +2404,8 @@ class App:
         self.setup_status = None
         self.zero_btn = None
         self.nosignal = None
+        self.video_flip_h_btn = None
+        self.video_flip_v_btn = None
         if stage != self.STAGE_RUN:
             self.canvas.itemconfigure(self.video_item, image="")
             self.photo = None
@@ -2111,6 +2441,9 @@ class App:
         self.zero_time = time.monotonic()
         self.peak_az = 0.0
         self.axis_det = AxisDetector(q)
+        # A saved axis can be stale after hardware, case or firmware changes.
+        # The deliberate tilt-up check proves it for this zero/reference.
+        self.axis_verified = False
         return True
 
     # ---- stage 1: instructions, indicator deliberately absent
@@ -2181,7 +2514,7 @@ class App:
             text="PROBE: \u2026", fill=DIM, font=self.f(small))
         z.append(self.setup_status)
         z.append(c.create_text(W - max(10, H // 46), H - max(10, H // 46),
-                               anchor="se", text="app v" + APP_VER,
+                               anchor="se", text="USB-C host app v" + APP_VER,
                                fill=MUTED, font=self.f(small)))
 
     def do_zero(self):
@@ -2294,9 +2627,16 @@ class App:
         self.save_cfg()
         # A new axis invalidates the old reference, so re-zero immediately.
         if self.capture_zero():
+            # Manually pressing AXIS is an explicit operator choice, so it can
+            # satisfy the gate without the automatic gesture overwriting it.
+            self.axis_verified = True
             self.set_stage(self.STAGE_CHECK)
 
     def start_run(self):
+        if not self.axis_verified:
+            self.toast("TILT LENS UP UNTIL AXIS LOCKS — OR CHOOSE AXIS", WARN,
+                       ms=2600)
+            return
         self.set_stage(self.STAGE_RUN)
 
     # ---- stage 3: live view
@@ -2306,8 +2646,20 @@ class App:
         pad = max(10, H // 46)
         bs = max(12, int(H / 30))
 
-        self.button(pad, pad, "\u2715  EXIT", "#c62828", self.quit, bs,
-                    store=self.hud, anchor="nw")
+        _, _, _, exit_h = self.button(
+            pad, pad, "\u2715  EXIT", "#c62828", self.quit, bs,
+            store=self.hud, anchor="nw")
+        # Independent live-view pixel transforms.  Green means active and the
+        # state is persisted in ~/.config/endoscope.json.
+        flip_size = max(10, int(H / 38))
+        flip_y = pad + exit_h + max(8, H // 80)
+        self.video_flip_h_btn = self.button(
+            pad, flip_y, "MIRROR L/R", "#2e7d32" if self.video_flip_h else "#455a64",
+            self.toggle_video_flip_h, flip_size, store=self.hud, anchor="nw")[:2]
+        flip_y += flip_size * 2 + 30 + max(8, H // 100)
+        self.video_flip_v_btn = self.button(
+            pad, flip_y, "FLIP U/D", "#2e7d32" if self.video_flip_v else "#455a64",
+            self.toggle_video_flip_v, flip_size, store=self.hud, anchor="nw")[:2]
         self.button(W - pad, H - pad, "ZERO", "#1565c0", self.zero_inplace,
                     bs, store=self.hud, anchor="se")
         if self.args.legacy_colour_tools and not self.clean_video:
@@ -2327,23 +2679,6 @@ class App:
             font=self.f(max(9, int(H / 54))))
         self.hud.append(self.regs_item)
 
-        # ---- display flip buttons (v6) ---------------------------------
-        # Bottom-right, stacked above ZERO so the thumb reaches all three
-        # without crossing the picture. They only ever touch the displayed
-        # frame; the indicator keeps reading the probe's real attitude.
-        fbs = max(11, int(H / 36))
-        zero_h = fbs * 2 + 30
-        fy = H - pad - zero_h - int(H * 0.020)
-        r, t, fw_btn, fh_btn = self.button(
-            W - pad, fy, "FLIP V", FLIP_ON if self.flip_v else FLIP_OFF,
-            self.toggle_flip_v, fbs, store=self.hud, anchor="se")
-        self.flip_btn["flip_v"] = (r, t)
-        r, t, _, _ = self.button(
-            W - pad, fy - fh_btn - int(H * 0.018), "FLIP H",
-            FLIP_ON if self.flip_h else FLIP_OFF,
-            self.toggle_flip_h, fbs, store=self.hud, anchor="se")
-        self.flip_btn["flip_h"] = (r, t)
-
         panel = int(min(W, H) * 0.33)
         px, py = W - panel - pad, pad
         self.hud.append(c.create_rectangle(px, py, px + panel, py + panel,
@@ -2358,13 +2693,6 @@ class App:
                                      text="", fill=DIM,
                                      font=self.f(max(9, panel // 17)))
         self.hud.append(self.readout)
-        # A mirrored picture moves opposite to the arrow. That is dangerous
-        # while steering, so the warning sits ON the indicator panel, where
-        # the operator is already looking, not in the status line.
-        self.mirror_flag = c.create_text(
-            px + panel / 2, py + panel * 0.99, text="", fill=WARN,
-            font=self.f(max(8, panel // 19), True), state="hidden")
-        self.hud.append(self.mirror_flag)
         self.statusbar = c.create_text(pad, H - pad, anchor="sw", text="",
                                        fill=MUTED,
                                        font=self.f(max(8, H // 62)))
@@ -2374,75 +2702,42 @@ class App:
                                       font=self.f(max(15, int(H / 20)), True),
                                       state="hidden")
         self.hud.append(self.nosignal)
-        # Flips persist across restarts, so paint the buttons and the mirror
-        # warning to match what was restored from the config file.
-        self._refresh_flip_labels()
 
-    def _apply_flips(self, img):
-        """
-        Mirror the displayed frame. Picture only -- never the attitude.
+    def _apply_video_orientation(self, image):
+        """Apply display-only orientation without touching IMU coordinates."""
+        if image is None:
+            return None
+        out = cv2.rotate(image, cv2.ROTATE_180) if self.rot180 else image
+        if self.video_flip_h and self.video_flip_v:
+            return cv2.flip(out, -1)
+        if self.video_flip_h:
+            return cv2.flip(out, 1)
+        if self.video_flip_v:
+            return cv2.flip(out, 0)
+        return out
 
-        cv2.flip codes: 1 = about the vertical axis (left/right mirror),
-        0 = about the horizontal axis (up/down), -1 = both, which is the same
-        result as a 180-degree rotation. Doing both in one call is cheaper
-        than two passes over the buffer, which matters on a Pi pushing frames
-        at video rate.
-        """
-        if self.flip_h and self.flip_v:
-            return cv2.flip(img, -1)
-        if self.flip_h:
-            return cv2.flip(img, 1)
-        if self.flip_v:
-            return cv2.flip(img, 0)
-        return img
+    def _refresh_video_flip_buttons(self):
+        for button, active in ((self.video_flip_h_btn, self.video_flip_h),
+                               (self.video_flip_v_btn, self.video_flip_v)):
+            if button:
+                self.canvas.itemconfigure(button[0],
+                                          fill="#2e7d32" if active else "#455a64")
 
-    def toggle_flip_h(self):
-        """
-        Mirror left/right.
-
-        WARNING SHOWN TO THE OPERATOR: a horizontal mirror decouples the
-        picture from the direction indicator. The probe still physically
-        turns right when the arrow says right, but a mirrored image will
-        appear to move LEFT. That is a real hazard when steering by video, so
-        the HUD carries a persistent marker while this is on. A vertical flip
-        does not have this problem for left/right, so it gets no marker.
-        """
-        self.flip_h = not self.flip_h
+    def toggle_video_flip_h(self):
+        self.video_flip_h = not self.video_flip_h
         self.save_cfg()
-        self._refresh_flip_labels()
-        if self.flip_h:
-            self.toast("MIRRORED \u2014 image left/right is reversed "
-                       "vs the arrow", WARN, ms=2600)
-        else:
-            self.toast("Mirror off", OK)
+        self.last_seq = -1
+        self._refresh_video_flip_buttons()
+        self.toast("VIDEO MIRROR L/R: " + ("ON" if self.video_flip_h else "OFF"),
+                   OK, ms=1200)
 
-    def toggle_flip_v(self):
-        """Flip the picture up/down. Does not affect the indicator."""
-        self.flip_v = not self.flip_v
+    def toggle_video_flip_v(self):
+        self.video_flip_v = not self.video_flip_v
         self.save_cfg()
-        self._refresh_flip_labels()
-        self.toast("Flip V on" if self.flip_v else "Flip V off", OK)
-
-    def _refresh_flip_labels(self):
-        """Repaint the two flip buttons so their state is visible at a glance."""
-        for key, on in (("flip_h", self.flip_h), ("flip_v", self.flip_v)):
-            item = self.flip_btn.get(key)
-            if not item:
-                continue
-            rect, label = item
-            try:
-                self.canvas.itemconfigure(rect, fill=(FLIP_ON if on
-                                                      else FLIP_OFF))
-                self.canvas.itemconfigure(label, fill=("#0d1117" if on
-                                                       else "#ffffff"))
-            except Exception:
-                pass
-        # Persistent mirror warning next to the indicator.
-        if getattr(self, "mirror_flag", None):
-            self.canvas.itemconfigure(
-                self.mirror_flag,
-                text="MIRRORED" if self.flip_h else "",
-                state="normal" if self.flip_h else "hidden")
+        self.last_seq = -1
+        self._refresh_video_flip_buttons()
+        self.toast("VIDEO FLIP U/D: " + ("ON" if self.video_flip_v else "OFF"),
+                   OK, ms=1200)
 
     def toggle_test_pattern(self):
         """
@@ -2561,15 +2856,6 @@ class App:
                 self.toast("OFFICIAL VIDEO PATH — colour overrides disabled",
                            OK, ms=1400)
             return
-        # v6: display flips. Deliberately NOT in the colour-override
-        # block above -- flipping is a legitimate operator control on
-        # the official video path, not a colour experiment.
-        if k == "h" and self.stage == self.STAGE_RUN:
-            self.toggle_flip_h()
-            return
-        if k == "j" and self.stage == self.STAGE_RUN:
-            self.toggle_flip_v()
-            return
         if k == "z":
             if self.stage == self.STAGE_RUN:
                 self.zero_inplace()
@@ -2583,6 +2869,10 @@ class App:
             self.cycle_colour()
         elif k == "f" and self.stage == self.STAGE_CHECK:
             self.flip_axis()
+        elif k == "h" and self.stage == self.STAGE_RUN:
+            self.toggle_video_flip_h()
+        elif k == "v" and self.stage == self.STAGE_RUN:
+            self.toggle_video_flip_v()
         elif k == "d" and self.stage == self.STAGE_RUN:
             self.toggle_diag()
         elif k == "n" and self.stage == self.STAGE_RUN:
@@ -2618,16 +2908,22 @@ class App:
             self.last_seq = -1
             self.toast("AUTO WHITE BALANCE: " + ("ON" if self.awb else "OFF"),
                        OK, ms=1400)
-        elif k == "v" and self.stage == self.STAGE_RUN:
-            self.rot180 = not self.rot180
-            self.save_cfg()
-            self.last_seq = -1          # redraw the current frame flipped
-            self.toast("ROTATE 180: " + ("ON" if self.rot180 else "OFF"),
-                       OK, ms=1200)
-
     # ---- per-frame update
 
     def probe_status_text(self, h):
+        if getattr(self.link, "is_usb_composite", False):
+            if h["state"] in ("searching", "connecting"):
+                return ("PROBE: waiting for USB IMU — check /dev/ttyACM*", DIM)
+            if h["state"] == "offline":
+                return ("PROBE: USB IMU offline — reconnect the Type-C cable", ALERT)
+            if h["camera_failed"]:
+                retries = h.get("camera_reconnects", 0)
+                return ("PROBE: USB IMU online; UVC reconnecting"
+                        + (" ({})".format(retries) if retries else "")
+                        + " — check /dev/video*", WARN)
+            if h["calibrating"]:
+                return ("PROBE: USB video online; calibrating gyro — hold it still...", WARN)
+            return "PROBE: one-cable USB video + IMU online", OK
         if getattr(self.link, "is_uvc", False):
             if h["state"] in ("searching", "connecting"):
                 return ("PROBE: connect Pi Wi-Fi to AtomS3R-CAM-WiFi; "
@@ -2661,24 +2957,8 @@ class App:
             s += " \u2014 probe moved during calibration; keep it still a moment"
             return s, WARN
         if h.get("calib_ok") is False:
-            # Say WHICH failure this is. "Keep it still" is actively wrong
-            # when the sensor never answered, and it wastes the operator's
-            # time when the BMI270 threw post-configuration garbage. The
-            # firmware measured the number; use it.
-            sp = h.get("calib_spread")
-            if isinstance(sp, (int, float)) and sp < 0:
-                return (s + " \u00b7 GYRO NOT RESPONDING \u2014 IMU bus fault, "
-                        "not movement", WARN)
-            if isinstance(sp, (int, float)) and sp > 100:
-                return (s + " \u00b7 GYRO CALIB FAILED (spread %.0f\u00b0/s "
-                        "= sensor garbage, not you) \u2014 power-cycle the probe"
-                        % sp, WARN)
-            if isinstance(sp, (int, float)):
-                return (s + " \u00b7 GYRO CALIB FAILED (moved %.1f\u00b0/s, needs "
-                        "<3) \u2014 set it DOWN, cable slack, replug at the Pi "
-                        "end, wait 6 s" % sp, WARN)
-            return (s + " \u00b7 GYRO CALIB FAILED \u2014 set the probe down "
-                    "and power-cycle it", WARN)
+            return (s + " \u00b7 GYRO CALIB FAILED \u2014 reboot the probe "
+                    "and keep it still", WARN)
         fv = h.get("fw_ver")
         if fv == (0, 0):
             # It answered "ready" without a version: pre-v3 firmware.
@@ -2760,6 +3040,7 @@ class App:
                                   "HOLD THE PROBE STILL for a moment \u2026"))
                 else:
                     self.axis_auto = False
+                    self.axis_verified = True
                     self._hint_state = "locked"
                     if hit != self.axis_idx:
                         self.axis_idx = hit
@@ -2848,11 +3129,10 @@ class App:
                                                       and seq != self.last_seq)
             if show is not None and fresh:
                 self.last_seq = seq
-                if self.diag_photo is None and self.rot180:
-                    # The camera module sits upside-down in the case, so the
-                    # picture is delivered rotated; flip it for the operator.
-                    # DIAG stays unrotated: it must show the sensor's truth.
-                    show = cv2.rotate(show, cv2.ROTATE_180)
+                if self.diag_photo is None:
+                    # Video orientation is display-only. DIAG intentionally
+                    # stays unmodified so it always shows sensor truth.
+                    show = self._apply_video_orientation(show)
                 fh, fw = show.shape[:2]
                 scale = min(self.W / fw, self.H / fh)
                 small = cv2.resize(show, (int(fw * scale), int(fh * scale)),
@@ -2865,12 +3145,6 @@ class App:
                     small = self._pi_colour(small)
                 if self.awb and self.diag_photo is None and not uvc:
                     small, self._awb_gains = grey_world(small, self._awb_gains)
-                # Operator flips are the LAST thing done to the picture, and
-                # only to the picture. DIAG output is excluded on purpose: it
-                # exists to show the sensor's unaltered truth, and a mirrored
-                # diagnostic would be worse than none.
-                if self.diag_photo is None:
-                    small = self._apply_flips(small)
                 rgb = cv2.cvtColor(small, cv2.COLOR_BGR2RGB)
                 self.photo = ImageTk.PhotoImage(Image.fromarray(rgb))
                 self.canvas.itemconfigure(self.video_item, image=self.photo)
@@ -2883,7 +3157,7 @@ class App:
                 self.nosignal,
                 state="normal" if stale else "hidden",
                 text=("PROBE DISCONNECTED" if h["state"] != "online"
-                      else "NO VIDEO SIGNAL"))
+                      else "UVC RECONNECTING — KEEP USB-C CONNECTED"))
             if stale and self.photo is not None:
                 self.canvas.itemconfigure(self.video_item, image="")
                 self.photo = None
@@ -2894,9 +3168,15 @@ class App:
                 text="AZ {:+.0f}\u00b0   EL {:+.0f}\u00b0".format(
                     math.degrees(az), math.degrees(el)))
             bits = ["{:.0f} fps".format(h["fps"])]
-            if self.rot180:
-                bits.append("ROT180")
-            if uvc:
+            if self.video_flip_h:
+                bits.append("MIRROR")
+            if self.video_flip_v:
+                bits.append("V-FLIP")
+            if getattr(self.link, "is_usb_composite", False):
+                bits.append("USB UVC+IMU")
+                if h.get("camera_reconnects"):
+                    bits.append("UVC retry {}".format(h["camera_reconnects"]))
+            elif uvc:
                 bits.append("OFFICIAL UVC")
             elif self.awb:
                 bits.append("AWB")
@@ -2915,6 +3195,8 @@ class App:
                 bits.append("bias trim")
             if h["bad"]:
                 bits.append("{} bad pkts".format(h["bad"]))
+            if h.get("dropped"):
+                bits.append("{} IMU drops".format(h["dropped"]))
             self.canvas.itemconfigure(self.statusbar, text="    ".join(bits))
 
         self.root.after(40, self.update)
@@ -3229,7 +3511,7 @@ class App:
                            % (ack[1], ack[3]), WARN, ms=1800)
         if frame is not None and seq != self.last_seq and self.tune_video:
             self.last_seq = seq
-            img = cv2.rotate(frame, cv2.ROTATE_180) if self.rot180 else frame
+            img = self._apply_video_orientation(frame)
             fh, fw = img.shape[:2]
             bw, bh = self.tune_box[2], self.tune_box[3]
             scale = min(bw / fw, bh / fh)
@@ -3753,7 +4035,7 @@ class App:
         if frame is None or seq == self.last_seq:
             return
         self.last_seq = seq
-        img = cv2.rotate(frame, cv2.ROTATE_180) if self.rot180 else frame
+        img = self._apply_video_orientation(frame)
         raw, cor, flat = self._cal_measure(img)
         self.cal_meas = (raw, cor, flat)
 
@@ -3840,7 +4122,8 @@ class App:
 
 def main():
     ap = argparse.ArgumentParser(description="Endoscope viewer with aim indicator")
-    ap.add_argument("--port", help="e.g. /dev/ttyACM0 (auto-detected if omitted)")
+    ap.add_argument("--port", help="IMU serial node, e.g. /dev/ttyACM0 "
+                                   "(auto-detected if omitted)")
     ap.add_argument("--baud", type=int, default=115200)
     ap.add_argument("--video", metavar="N",
                     help="take video from a standard UVC camera instead of the "
@@ -3852,6 +4135,9 @@ def main():
     ap.add_argument("--official", action="store_true",
                     help="use M5Stack stock firmware: UVC video plus raw IMU from "
                          "ws://192.168.4.1; no custom colour path")
+    ap.add_argument("--usb-composite", "--usb", action="store_true",
+                    help="v6.0.1 recommended mode: UVC video and fused IMU over the "
+                         "same USB-C cable; no Wi-Fi")
     ap.add_argument("--imu-ws", default="ws://192.168.4.1/api/v1/ws/imu_data",
                     help="stock-firmware IMU WebSocket URL")
     ap.add_argument("--legacy-colour-tools", action="store_true",
@@ -3863,6 +4149,9 @@ def main():
                     help="record time, az, el, quaternion for drift analysis")
     args = ap.parse_args()
 
+    if args.official and args.usb_composite:
+        ap.error("choose --usb-composite or --official, not both")
+
     try:
         vw, vh = (int(x) for x in args.video_size.lower().split("x", 1))
         if vw < 16 or vh < 16:
@@ -3872,6 +4161,9 @@ def main():
 
     if args.sim:
         link = SimLink().start()
+    elif args.usb_composite:
+        link = UsbCompositeProbeLink(args.video or "auto", vw, vh,
+                                     args.port).start()
     elif args.official:
         link = OfficialProbeLink(args.video or "auto", vw, vh,
                                  args.imu_ws).start()
