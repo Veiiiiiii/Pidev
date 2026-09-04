@@ -110,7 +110,7 @@ from PIL import Image, ImageTk
 
 CONFIG = os.path.join(os.path.expanduser("~"), ".config", "endoscope.json")
 SYNC = b"\xa5\x5a"
-APP_VER = "4.4"
+APP_VER = "4.5"
 
 TYPE_IMU = 1
 TYPE_FRAME = 2
@@ -1159,6 +1159,7 @@ class App:
     STAGE_CHECK = 1      # zeroed; verify before entering the live view
     STAGE_RUN = 2
     STAGE_TUNE = 3       # manual sensor tuning: rows left, live picture right
+    STAGE_CAL = 4        # guided calibration: the screen is the colour target
 
     def __init__(self, link, args):
         self.link = link
@@ -1185,6 +1186,17 @@ class App:
         self.el_sign = 1.0 if self.cfg.get("el_sign", -1) > 0 else -1.0
         self.awb = bool(self.cfg.get("awb", True))
         self.tune_saved = self.cfg.get("tune")      # last DONE'd tuning, if any
+        cal = self.cfg.get("cal") or {}
+        self.pi_gains = [float(x) for x in cal.get("gains", [1.0, 1.0, 1.0])]  # B,G,R
+        self.pi_chan = [int(x) for x in cal.get("chan", [0, 1, 2])]            # BGR index map
+        self.cal_step = 0
+        self.cal_meas = None
+        self.cal_sign = 1
+        self.cal_perm = {}
+        self.cal_thumb = None
+        self.cal_thumb_photo = None
+        self.cal_thumb_dims = (160, 120)
+        self.cal_text = None
         self.tune = {"regs": {}, "cm": "0", "poke_reg": 0x93, "poke_val": 0x40}
         self.tune_page = 0
         self.tune_vals = {}
@@ -1272,7 +1284,8 @@ class App:
                            "el_sign": self.el_sign,
                            "awb": self.awb,
                            "swap_rb": self.swap_rb,
-                           "tune": self.tune_saved}, f)
+                           "tune": self.tune_saved,
+                           "cal": {"gains": self.pi_gains, "chan": self.pi_chan}}, f)
         except Exception:
             pass
 
@@ -1407,6 +1420,8 @@ class App:
             self.enter_check()
         elif stage == self.STAGE_TUNE:
             self.enter_tune()
+        elif stage == self.STAGE_CAL:
+            self.enter_cal()
         else:
             self.enter_run()
 
@@ -1905,6 +1920,10 @@ class App:
             self._tune_update(h, frame, seq)
             self.root.after(40, self.update)
             return
+        if self.stage == self.STAGE_CAL:
+            self._cal_update(h, frame, seq)
+            self.root.after(40, self.update)
+            return
 
         if self.stage == self.STAGE_SETUP:
             if self.setup_status:
@@ -2031,6 +2050,8 @@ class App:
                     # A red/blue transposition survives JPEG intact, so unlike
                     # a bit-order fault it can still be undone here.
                     small = small[:, :, ::-1]
+                if self.diag_photo is None:
+                    small = self._pi_colour(small)
                 if self.awb and self.diag_photo is None:
                     small, self._awb_gains = grey_world(small, self._awb_gains)
                 rgb = cv2.cvtColor(small, cv2.COLOR_BGR2RGB)
@@ -2113,9 +2134,9 @@ class App:
 
     def enter_tune(self):
         c, W, H, z = self.canvas, self.W, self.H, self.stage_items
-        pw = int(W * 0.47)
+        pw = int(W * 0.50)
         pad = max(10, H // 46)
-        small = max(11, int(H / 44))
+        small = max(10, int(H / 48))
         z.append(c.create_rectangle(0, 0, pw, H, fill="#0e161b", outline=""))
         z.append(c.create_text(12, 10, anchor="nw", fill="white",
                                text="TUNE   page {}/{}".format(
@@ -2126,33 +2147,45 @@ class App:
                                font=self.f(small - 1)))
 
         rows = self.TUNE_PAGES[self.tune_page]
-        y0, y1 = 48, H - 106
-        rh = min(46, (y1 - y0) // max(1, len(rows)))
-        bx = int(pw * 0.38)
-        bw = 34
+        y0, y1 = int(H * 0.08), H - int(H * 0.18)
+        rh = (y1 - y0) // max(1, len(rows))
+        # Everything is measured from the actual font so the columns fit any
+        # panel size (a 7-inch 800x480 is narrower than it looks). Shrink the
+        # font until the row fits.
+        samples = ["0x00  (000)", "YUV Cb-Y a0", "-128", "reg 0x00", "4095"]
+        while True:
+            lab_w = max(self.text_w(r[1], small) for r in rows) + 10
+            bw = self.text_w("<<", small, True) + 14
+            val_w = max(self.text_w(s, small, True) for s in samples) + 12
+            need = 12 + lab_w + 4 * (bw + 4) + val_w + 6
+            if need <= pw or small <= 8:
+                break
+            small -= 1
+        bh = min(rh - 6, int(H * 0.07))
         self.tune_vals = {}
         for i, (key, label, kind, spec) in enumerate(rows):
             y = y0 + i * rh
+            yb = y + (rh - bh) // 2
             z.append(c.create_text(12, y + rh / 2, anchor="w", text=label,
                                    fill="#cfd8dc", font=self.f(small)))
-            x = bx
+            x = 12 + lab_w
             for lab, d in (("<<", -2), ("<", -1)):
-                self._tune_btn(x, y + 4, bw, rh - 8, lab,
+                self._tune_btn(x, yb, bw, bh, lab,
                                lambda k=key, d=d: self._tune_step(k, d))
                 x += bw + 4
-            self.tune_vals[key] = c.create_text(x + 70, y + rh / 2, text="?",
-                                                fill="white",
+            self.tune_vals[key] = c.create_text(x + val_w / 2, y + rh / 2,
+                                                text="?", fill="white",
                                                 font=self.f(small, True))
             z.append(self.tune_vals[key])
-            x += 140 + 4
+            x += val_w
             for lab, d in ((">", 1), (">>", 2)):
-                self._tune_btn(x, y + 4, bw, rh - 8, lab,
+                self._tune_btn(x, yb, bw, bh, lab,
                                lambda k=key, d=d: self._tune_step(k, d))
                 x += bw + 4
 
         # live picture, right side
-        bx0, by0 = pw + 8, 48
-        bx1, by1 = W - 8, H - 106
+        bx0, by0 = pw + 8, int(H * 0.08)
+        bx1, by1 = W - 8, H - int(H * 0.18)
         self.tune_box = (bx0, by0, bx1 - bx0, by1 - by0)
         z.append(c.create_rectangle(bx0, by0, bx1, by1, outline=EDGE, width=1))
         self.tune_video = c.create_image((bx0 + bx1) // 2, (by0 + by1) // 2)
@@ -2161,8 +2194,8 @@ class App:
         self.last_seq = -1
 
         # values line: the thing to screenshot
-        self.tune_line = c.create_text(12, H - 84, anchor="w", text="",
-                                       fill="#9ccc65", font=self.f(max(11, int(H / 46)), True))
+        self.tune_line = c.create_text(12, H - int(H * 0.14), anchor="w", text="",
+                                       fill="#9ccc65", font=self.f(max(10, int(H / 50)), True))
         z.append(self.tune_line)
 
         bs = max(12, int(H / 34))
@@ -2170,6 +2203,8 @@ class App:
                     store=z, anchor="sw")
         self.button(12 + int(W * 0.13), H - pad, "PAGE", "#37474f",
                     self.tune_next_page, bs, store=z, anchor="sw")
+        self.button(12 + int(W * 0.26), H - pad, "CAL WIZARD", "#00695c",
+                    lambda: self.set_stage(self.STAGE_CAL), bs, store=z, anchor="sw")
         self.button(W - pad, H - pad, "DONE  \u2713", "#2e7d32", self.tune_done,
                     bs, store=z, anchor="se")
 
@@ -2181,7 +2216,7 @@ class App:
         c = self.canvas
         r = c.create_rectangle(x, y, x + w, y + h, fill="#37474f", outline="")
         t = c.create_text(x + w / 2, y + h / 2, text=label, fill="white",
-                          font=self.f(max(11, int(self.H / 44)), True))
+                          font=self.f(max(10, int(self.H / 48)), True))
         for item in (r, t):
             c.tag_bind(item, "<Button-1>", lambda e: cb())
         self.stage_items.extend((r, t))
@@ -2307,9 +2342,9 @@ class App:
     def _tune_values_line(self):
         regs = " ".join("%02x=%02x" % (r, self._reg(r, 0))
                         for r in self.TUNE_REGS if r in self.tune["regs"])
-        return "TUNE  {}  cm={}  |  pi rot={:d} awb={:d} rb={:d}".format(
+        return "TUNE  {}  cm={}  |  pi rot={:d} awb={:d} rb={:d} gains B{:.2f} R{:.2f}".format(
             regs or "(waiting for probe)", self.tune["cm"],
-            self.rot180, self.awb, self.swap_rb)
+            self.rot180, self.awb, self.swap_rb, self.pi_gains[0], self.pi_gains[2])
 
     def _tune_refresh(self):
         if self.stage != self.STAGE_TUNE:
@@ -2353,6 +2388,7 @@ class App:
                                interpolation=cv2.INTER_LINEAR)
             if self.swap_rb:
                 small = small[:, :, ::-1].copy()
+            small = self._pi_colour(small)
             if self.awb:
                 small, self._awb_gains = grey_world(small, self._awb_gains)
             rgb = cv2.cvtColor(small, cv2.COLOR_BGR2RGB)
@@ -2409,6 +2445,227 @@ class App:
         self._tune_gen_applied = self.link.health()["generation"]
         self.set_stage(self.STAGE_RUN)
         self.toast("TUNING SAVED \u2713", OK, ms=1600)
+
+
+    # ---- CALIBRATION WIZARD: the Pi screen is the colour reference --------
+    #
+    # The operator points the probe at this screen. Each step fills the
+    # screen with a known colour; the app measures what the camera reports
+    # for the centre of its frame and closes the loop: sensor WB gains for
+    # neutrals (best signal), Pi-side fixed gains for whatever the sensor
+    # cannot reach, a channel-map check from the red/green/blue patches,
+    # chroma saturation from red/blue, black level from black. Every
+    # measurement is shown as numbers, so nothing here relies on eyeballing.
+
+    CAL_STEPS = [
+        ("AIM",   None,            "Point the probe at THIS screen, 10-20 cm away, so the colour\nfills the camera view (green box in the thumbnail). Hold still. NEXT."),
+        ("WHITE", (255, 255, 255), "Neutral. AUTO adjusts the sensor WB gains until R = G = B.\nIf the sensor runs out of range the Pi takes over the rest."),
+        ("GREY",  (128, 128, 128), "Mid grey. AUTO nudges brightness so grey lands near 128."),
+        ("RED",   (0, 0, 255),     "Red patch. Checks which camera channel answers (channel map)\nand chroma purity (Cr saturation)."),
+        ("GREEN", (0, 255, 0),     "Green patch. Channel map check."),
+        ("BLUE",  (255, 0, 0),     "Blue patch. Channel map check and Cb saturation."),
+        ("BLACK", (0, 0, 0),       "Black. AUTO lowers brightness until black reads dark."),
+        ("DONE",  None,            "Summary below. SAVE stores sensor + Pi settings and returns."),
+    ]
+
+    def _pi_colour(self, img):
+        """Fixed per-channel gains + channel map found by the wizard (BGR)."""
+        if self.pi_chan != [0, 1, 2]:
+            img = img[:, :, self.pi_chan]
+        if any(abs(g - 1.0) > 0.01 for g in self.pi_gains):
+            img = np.clip(img.astype(np.float32) * np.array(self.pi_gains, np.float32),
+                          0, 255).astype(np.uint8)
+        return img
+
+    def enter_cal(self):
+        c, W, H, z = self.canvas, self.W, self.H, self.stage_items
+        name, colour, text = self.CAL_STEPS[self.cal_step]
+        bg = "#%02x%02x%02x" % (colour[2], colour[1], colour[0]) if colour else "#102027"
+        z.append(c.create_rectangle(0, 0, W, H, fill=bg, outline=""))
+        cx, cy = W * 0.66, H * 0.40                 # aiming cross, patch centre
+        dim = "#7f7f7f" if colour and sum(colour) > 380 else "#c0c0c0"
+        z.append(c.create_line(cx - 30, cy, cx + 30, cy, fill=dim))
+        z.append(c.create_line(cx, cy - 30, cx, cy + 30, fill=dim))
+        # control panel bottom-left, small so it stays out of the shot
+        pw, ph = int(W * 0.50), int(H * 0.46)
+        x0, y0 = 8, H - ph - 8
+        z.append(c.create_rectangle(x0, y0, x0 + pw, y0 + ph, fill="#0e161b",
+                                    outline=EDGE))
+        small = max(10, int(H / 50))
+        z.append(c.create_text(x0 + 10, y0 + 8, anchor="nw", fill="white",
+                               text="CAL {}/{}   {}".format(self.cal_step + 1,
+                                                            len(self.CAL_STEPS), name),
+                               font=self.f(small + 2, True)))
+        tw, th = int(pw * 0.30), int(pw * 0.30 * 0.75)
+        z.append(c.create_text(x0 + 10, y0 + 12 + small * 2.4, anchor="nw",
+                               fill="#b0bec5", text=text, font=self.f(small - 1),
+                               width=pw - tw - 30))
+        self.cal_text = c.create_text(x0 + 10, y0 + ph - int(H * 0.085) - 6, anchor="sw",
+                                      fill="#9ccc65", text="camera: waiting \u2026",
+                                      font=self.f(small, True))
+        z.append(self.cal_text)
+        self.cal_thumb = c.create_image(x0 + pw - 10 - tw / 2, y0 + 10 + th / 2)
+        z.append(self.cal_thumb)
+        self.cal_thumb_dims = (tw, th)
+        bs = max(11, int(H / 40))
+        bx = x0 + 10
+        if self.cal_step:
+            self.button(bx, y0 + ph - 8, "\u2039 BACK", "#455a64", self.cal_back, bs,
+                        store=z, anchor="sw")
+            bx += self.text_w("\u2039 BACK", bs, True) + 44
+        if colour is not None and name != "GREEN":
+            self.button(bx, y0 + ph - 8, "AUTO", "#00695c", self.cal_auto, bs,
+                        store=z, anchor="sw")
+        if name == "DONE":
+            self.button(x0 + pw - 10, y0 + ph - 8, "SAVE  \u2713", "#2e7d32",
+                        self.cal_save, bs, store=z, anchor="se")
+        else:
+            self.button(x0 + pw - 10, y0 + ph - 8, "NEXT  \u203a", "#1565c0",
+                        self.cal_next, bs, store=z, anchor="se")
+        self.button(W - 8, 8, "\u2715", "#c62828",
+                    lambda: self.set_stage(self.STAGE_TUNE), bs, store=z, anchor="ne")
+        self.cal_meas = None
+        self.last_seq = -1
+        if self.cal_step == 1:                     # neutral step: AWB must not fight us
+            self._tune_clear_auto(0x02, "WHITE BAL")
+
+    def cal_next(self):
+        name = self.CAL_STEPS[self.cal_step][0]
+        if name in ("RED", "GREEN", "BLUE") and self.cal_meas is not None:
+            self.cal_perm[name] = self.cal_meas[0]          # raw B,G,R means
+        if self.cal_step < len(self.CAL_STEPS) - 1:
+            self.cal_step += 1
+            self.set_stage(self.STAGE_CAL)
+
+    def cal_back(self):
+        if self.cal_step > 0:
+            self.cal_step -= 1
+            self.set_stage(self.STAGE_CAL)
+
+    def _cal_measure(self, frame):
+        """Mean B,G,R of the centre 40% of the decoded frame: raw and after
+        the Pi correction."""
+        fh, fw = frame.shape[:2]
+        roi = frame[int(fh * 0.3):int(fh * 0.7), int(fw * 0.3):int(fw * 0.7)]
+        raw = roi.reshape(-1, 3).mean(axis=0)
+        cor = self._pi_colour(roi).reshape(-1, 3).mean(axis=0)
+        return raw, cor
+
+    def _cal_update(self, h, frame, seq):
+        if frame is None or seq == self.last_seq:
+            return
+        self.last_seq = seq
+        img = cv2.rotate(frame, cv2.ROTATE_180) if self.rot180 else frame
+        raw, cor = self._cal_measure(img)
+        self.cal_meas = (raw, cor)
+        name = self.CAL_STEPS[self.cal_step][0]
+        txt = "camera raw  R {:3.0f} G {:3.0f} B {:3.0f}   |  shown  R {:3.0f} G {:3.0f} B {:3.0f}".format(
+            raw[2], raw[1], raw[0], cor[2], cor[1], cor[0])
+        txt += "\nsensor 5a/5b/5c = {:02x}/{:02x}/{:02x}  b1/b2 = {:02x}/{:02x}  b5 = {:02x}   Pi gains B{:.2f} R{:.2f}".format(
+            self._reg(0x5a, 0), self._reg(0x5b, 0), self._reg(0x5c, 0),
+            self._reg(0xb1, 0), self._reg(0xb2, 0), self._reg(0xb5, 0),
+            self.pi_gains[0], self.pi_gains[2])
+        if self.cal_text:
+            self.canvas.itemconfigure(self.cal_text, text=txt)
+        tw, th = self.cal_thumb_dims
+        small = cv2.resize(img, (tw, th), interpolation=cv2.INTER_AREA)
+        small = self._pi_colour(small)
+        cv2.rectangle(small, (int(tw * 0.3), int(th * 0.3)),
+                      (int(tw * 0.7), int(th * 0.7)), (80, 255, 80), 1)
+        rgb = cv2.cvtColor(small, cv2.COLOR_BGR2RGB)
+        self.cal_thumb_photo = ImageTk.PhotoImage(Image.fromarray(rgb))
+        if self.cal_thumb:
+            self.canvas.itemconfigure(self.cal_thumb, image=self.cal_thumb_photo)
+
+    def cal_auto(self, rounds=5):
+        """One closed-loop iteration for the current step, repeated up to
+        `rounds` times 600 ms apart so each new setting reaches a frame."""
+        if self.cal_meas is None or self.stage != self.STAGE_CAL:
+            if self.stage == self.STAGE_CAL:
+                self.toast("NO CAMERA FRAME YET", WARN)
+            return
+        raw, cor = self.cal_meas
+        name = self.CAL_STEPS[self.cal_step][0]
+        done = False
+        if name == "WHITE":
+            b, g, r = raw
+            if min(b, g, r) < 8:
+                self.toast("TOO DARK TO BALANCE \u2014 more light or closer", WARN)
+                return
+            gr, gb = self._reg(0x5a, 0x40), self._reg(0x5c, 0x40)
+            nr = int(round(gr * g / max(r, 1.0)))
+            nb = int(round(gb * g / max(b, 1.0)))
+            nr_c, nb_c = max(0x10, min(0xff, nr)), max(0x10, min(0xff, nb))
+            self._tune_write(0x5a, nr_c)
+            self._tune_write(0x5c, nb_c)
+            # what the sensor cannot deliver, the Pi finishes
+            self.pi_gains = [round(min(4.0, max(0.25, nb / nb_c)), 3), 1.0,
+                             round(min(4.0, max(0.25, nr / nr_c)), 3)]
+            done = abs(r - g) < 4 and abs(b - g) < 4
+        elif name in ("GREY", "BLACK"):
+            target = 128 if name == "GREY" else 16
+            L = float(cor.mean())
+            err = target - L
+            if abs(err) < 6:
+                done = True
+            else:
+                prev = getattr(self, "_cal_prev", None)
+                if prev is not None and (L - prev) * self.cal_sign * getattr(self, "_cal_last_step", 0) < 0:
+                    self.cal_sign = -self.cal_sign      # register acts the other way
+                cur = self._reg(0xb5, 0)
+                cur_s = cur - 256 if cur > 127 else cur
+                step = int(max(-24, min(24, err / 2)))
+                self._cal_last_step = step
+                new = max(-128, min(127, cur_s + step * self.cal_sign)) & 0xff
+                self._tune_write(0xb5, new)
+                self._cal_prev = L
+        elif name in ("RED", "BLUE"):
+            b, g, r = cor
+            hi = max(b, g, r)
+            purity = (hi - min(b, g, r)) / max(hi, 1.0)
+            reg = 0xb2 if name == "RED" else 0xb1
+            if purity < 0.55 and self._reg(reg, 0x40) < 0x90:
+                self._tune_write(reg, self._reg(reg, 0x40) + 8)
+            elif purity > 0.9 and self._reg(reg, 0x40) > 0x20:
+                self._tune_write(reg, self._reg(reg, 0x40) - 8)
+            else:
+                done = True
+        self.save_cfg()
+        if not done and rounds > 1:
+            self.root.after(600, lambda: self.cal_auto(rounds - 1))
+        elif done:
+            self.toast("STEP {} OK \u2713".format(name), OK, ms=1200)
+
+    def _cal_channel_check(self):
+        """After RED/GREEN/BLUE: which camera channel answered each patch."""
+        perm = [0, 1, 2]
+        for idx, name in ((2, "RED"), (1, "GREEN"), (0, "BLUE")):
+            m = self.cal_perm.get(name)
+            if m is not None:
+                perm[idx] = int(np.argmax(m))
+        return perm
+
+    def cal_save(self):
+        if len(self.cal_perm) == 3:
+            perm = self._cal_channel_check()
+            if sorted(perm) == [0, 1, 2]:
+                self.pi_chan = perm
+                if perm != [0, 1, 2]:
+                    self.toast("CHANNEL MAP CORRECTED: BGR -> {}".format(perm), OK, ms=1800)
+        self.tune_saved = {"regs": {"%02x" % r: self._reg(r, 0)
+                                    for r in self.TUNE_REGS if r in self.tune["regs"]},
+                           "cm": self.tune["cm"]}
+        self.save_cfg()
+        try:
+            with open(os.path.expanduser("~/endoscope_tune.txt"), "a", encoding="utf-8") as f:
+                f.write(time.strftime("%Y-%m-%d %H:%M:%S  CAL ") + self._tune_values_line()
+                        + "  pi_gains={} chan={}\n".format(self.pi_gains, self.pi_chan))
+        except Exception:
+            pass
+        self.cal_step = 0
+        self.cal_perm = {}
+        self.set_stage(self.STAGE_RUN)
+        self.toast("CALIBRATION SAVED \u2713", OK, ms=1800)
 
     def quit(self):
         if self.log:
