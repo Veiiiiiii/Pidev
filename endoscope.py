@@ -520,6 +520,7 @@ class ProbeLink:
         self.colour_mode = None         # probe's current colour mode, if told
         self.raw_swap = False           # byte order for the raw stream
         self.raw_stream = False         # probe is sending unconverted bytes
+        self.test_pattern = False       # probe is sending synthetic bars
         self.calib_ok = None            # gyro calibration verdict, if told
         self.raw = None                 # last raw frame for the DIAG grid
         self.raw_seq = 0
@@ -737,6 +738,8 @@ class ProbeLink:
                                         else None)
                     cal = data.get("calib")
                     self.calib_ok = (bool(cal) if cal is not None else None)
+            elif st == "test_pattern":
+                self.test_pattern = bool(data.get("on"))
             elif st == "raw_stream":
                 self.raw_stream = bool(data.get("on"))
             elif st == "colour_mode":
@@ -765,6 +768,7 @@ class ProbeLink:
                 "fw_ver": self.fw_ver,
                 "colour_mode": self.colour_mode,
                 "raw_stream": self.raw_stream,
+                "test_pattern": self.test_pattern,
                 "calib_ok": self.calib_ok,
                 "raw_seq": self.raw_seq,
                 "calibrating": self.calibrating,
@@ -1531,6 +1535,22 @@ class App:
                                       state="hidden")
         self.hud.append(self.nosignal)
 
+    def toggle_test_pattern(self):
+        """
+        Put a known image into the pipeline instead of the sensor's.
+
+        Colour bars and a grey ramp are generated in the probe and travel the
+        identical path a camera frame takes. Because the input is known, the
+        output is diagnostic on its own: clean bars mean the pipeline is
+        sound and the sensor's pixels are the problem; wrong bars name the
+        fault by the way they are wrong.
+        """
+        if not self.link.send_byte(ord("t")):
+            self.toast("PROBE NOT CONNECTED", WARN)
+            return
+        self.toast("TEST PATTERN toggled \u2014 expect 8 colour bars "
+                   "over a grey ramp", OK, ms=3200)
+
     def toggle_raw_stream(self):
         """
         Ask the probe to stop encoding and just send its bytes.
@@ -1624,6 +1644,8 @@ class App:
             self.flip_axis()
         elif k == "d" and self.stage == self.STAGE_RUN:
             self.toggle_diag()
+        elif k == "t" and self.stage == self.STAGE_RUN:
+            self.toggle_test_pattern()
         elif k == "r" and self.stage == self.STAGE_RUN:
             self.toggle_raw_stream()
         elif k == "x" and self.stage == self.STAGE_RUN:
@@ -1851,6 +1873,8 @@ class App:
                 bits.append("AWB")
             if h.get("raw_stream"):
                 bits.append("RAW" + ("~" if self.link.raw_swap else ""))
+            if h.get("test_pattern"):
+                bits.append("TESTPAT")
             if self.diag_photo is not None:
                 bits.append("DIAG")
             if h["state"] != "online":
