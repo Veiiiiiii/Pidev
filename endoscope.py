@@ -1256,10 +1256,10 @@ class App:
         cal = self.cfg.get("cal") or {}
         self.pi_gains = [float(x) for x in cal.get("gains", [1.0, 1.0, 1.0])]  # B,G,R
         self.pi_chan = [int(x) for x in cal.get("chan", [0, 1, 2])]            # BGR index map
+        self.pi_bright = float(cal.get("bright", 0.0))    # -80 .. +80, added
+        self.pi_sat = float(cal.get("sat", 1.0))          # 0 .. 2, multiplies
         self.pi_matrix = cal.get("matrix")           # 4x3 colour correction, or None
         self._bars_pending = False
-        self._cal_all = False
-        self.cal_step = 0
         self.cal_meas = None
         self.cal_sign = 1
         self.cal_perm = {}
@@ -1356,6 +1356,7 @@ class App:
                            "swap_rb": self.swap_rb,
                            "tune": self.tune_saved,
                            "cal": {"gains": self.pi_gains, "chan": self.pi_chan,
+                                   "bright": self.pi_bright, "sat": self.pi_sat,
                                    "matrix": self.pi_matrix}}, f)
         except Exception:
             pass
@@ -2560,126 +2561,237 @@ class App:
     # chroma saturation from red/blue, black level from black. Every
     # measurement is shown as numbers, so nothing here relies on eyeballing.
 
-    CAL_STEPS = [
-        ("AIM",   None,            "Point the probe at THIS screen, 10-20 cm away, so the colour\nfills the camera view (green box in the thumbnail). Hold still. NEXT."),
-        ("WHITE", (255, 255, 255), "Neutral. AUTO adjusts the sensor WB gains until R = G = B.\nIf the sensor runs out of range the Pi takes over the rest."),
-        ("GREY",  (128, 128, 128), "Mid grey. AUTO nudges brightness so grey lands near 128."),
-        ("RED",   (0, 0, 255),     "Red patch. Checks which camera channel answers (channel map)\nand chroma purity (Cr saturation)."),
-        ("GREEN", (0, 255, 0),     "Green patch. Channel map check."),
-        ("BLUE",  (255, 0, 0),     "Blue patch. Channel map check and Cb saturation."),
-        ("BLACK", (0, 0, 0),       "Black. AUTO lowers brightness until black reads dark."),
-        ("DONE",  None,            "Summary below. SAVE stores sensor + Pi settings and returns."),
-    ]
 
     def _pi_colour(self, img):
-        """Fixed per-channel gains + channel map found by the wizard (BGR)."""
+        """
+        Channel map, per-channel gain, brightness, saturation. In that order,
+        because white balance has to happen before saturation or a cast gets
+        amplified along with the colour you wanted.
+        """
         if self.pi_chan != [0, 1, 2]:
             img = img[:, :, self.pi_chan]
         if self.pi_matrix:
             M = np.array(self.pi_matrix, np.float32)          # 4x3: rows B,G,R,offset
             flat = img.reshape(-1, 3).astype(np.float32)
-            out = flat @ M[:3] + M[3]
-            return np.clip(out, 0, 255).astype(np.uint8).reshape(img.shape)
-        if any(abs(g - 1.0) > 0.01 for g in self.pi_gains):
-            img = np.clip(img.astype(np.float32) * np.array(self.pi_gains, np.float32),
-                          0, 255).astype(np.uint8)
-        return img
+            img = np.clip(flat @ M[:3] + M[3], 0, 255).astype(np.uint8).reshape(img.shape)
+
+        need_gain = any(abs(g - 1.0) > 0.01 for g in self.pi_gains)
+        need_bri = abs(self.pi_bright) > 0.5
+        need_sat = abs(self.pi_sat - 1.0) > 0.01
+        if not (need_gain or need_bri or need_sat):
+            return img
+
+        out = img.astype(np.float32)
+        if need_gain:
+            out *= np.array(self.pi_gains, np.float32)
+        if need_bri:
+            out += self.pi_bright
+        if need_sat:
+            grey = out.mean(axis=2, keepdims=True)
+            out = grey + (out - grey) * self.pi_sat
+        return np.clip(out, 0, 255).astype(np.uint8)
+
+    # ---- colour panel: manual control, plus one reliable automatic ---------
+
+    COLOUR_ROWS = [
+        ("RED",        "gain", 2, 0.05, 0.25, 4.0),
+        ("GREEN",      "gain", 1, 0.05, 0.25, 4.0),
+        ("BLUE",       "gain", 0, 0.05, 0.25, 4.0),
+        ("BRIGHTNESS", "bri",  0, 4.0,  -80.0, 80.0),
+        ("SATURATION", "sat",  0, 0.05, 0.0,  2.0),
+    ]
+
+    def _colour_value(self, kind, idx):
+        if kind == "gain":
+            return self.pi_gains[idx]
+        return self.pi_bright if kind == "bri" else self.pi_sat
+
+    def _colour_set(self, kind, idx, val, lo, hi):
+        val = max(lo, min(hi, val))
+        if kind == "gain":
+            self.pi_gains[idx] = round(val, 3)
+        elif kind == "bri":
+            self.pi_bright = round(val, 1)
+        else:
+            self.pi_sat = round(val, 3)
+        self.last_seq = -1                     # force the preview to redraw
+        self._refresh_colour_readouts()
 
     def enter_cal(self):
+        """
+        Manual colour control with a live preview, and one automatic that is
+        actually dependable.
+
+        The previous wizard asked the operator to aim the probe at coloured
+        patches on this screen. Too much rides on things it cannot see: aim,
+        screen brightness, viewing angle, reflections. One bad patch poisons
+        the whole matrix, which is why every automatic result came out wrong.
+
+        A grey card needs none of that. Point at anything neutral -- paper, a
+        white wall -- and the three gains that make it neutral are arithmetic,
+        not inference. Everything else here is a direct control the operator
+        can see the effect of while pressing it.
+        """
         c, W, H, z = self.canvas, self.W, self.H, self.stage_items
-        name, colour, text = self.CAL_STEPS[self.cal_step]
-        bg = "#%02x%02x%02x" % (colour[2], colour[1], colour[0]) if colour else "#102027"
-        z.append(c.create_rectangle(0, 0, W, H, fill=bg, outline=""))
-        cx, cy = W * 0.66, H * 0.40                 # aiming cross, patch centre
-        dim = "#7f7f7f" if colour and sum(colour) > 380 else "#c0c0c0"
-        z.append(c.create_line(cx - 30, cy, cx + 30, cy, fill=dim))
-        z.append(c.create_line(cx, cy - 30, cx, cy + 30, fill=dim))
-        # control panel bottom-left, small so it stays out of the shot
-        pw, ph = int(W * 0.50), int(H * 0.46)
-        x0, y0 = 8, H - ph - 8
-        z.append(c.create_rectangle(x0, y0, x0 + pw, y0 + ph, fill="#0e161b",
-                                    outline=EDGE))
-        small = max(10, int(H / 50))
-        z.append(c.create_text(x0 + 10, y0 + 8, anchor="nw", fill="white",
-                               text="CAL {}/{}   {}".format(self.cal_step + 1,
-                                                            len(self.CAL_STEPS), name),
-                               font=self.f(small + 2, True)))
-        tw, th = int(pw * 0.30), int(pw * 0.30 * 0.75)
-        z.append(c.create_text(x0 + 10, y0 + 12 + small * 2.4, anchor="nw",
-                               fill="#b0bec5", text=text, font=self.f(small - 1),
-                               width=pw - tw - 30))
-        self.cal_text = c.create_text(x0 + 10, y0 + ph - int(H * 0.085) - 6, anchor="sw",
-                                      fill="#9ccc65", text="camera: waiting \u2026",
-                                      font=self.f(small, True))
-        z.append(self.cal_text)
-        self.cal_thumb = c.create_image(x0 + pw - 10 - tw / 2, y0 + 10 + th / 2)
+        z.append(c.create_rectangle(0, 0, W, H, fill="#0b1114", outline=""))
+
+        pad = max(10, int(H / 40))
+        title = max(14, int(H / 24))
+        row_f = max(11, int(H / 32))
+        small = max(9, int(H / 46))
+
+        z.append(c.create_text(pad, pad, anchor="nw", text="COLOUR",
+                               fill="#ffffff", font=self.f(title, True)))
+        z.append(c.create_text(pad, pad + title * 1.9, anchor="nw",
+                               fill=DIM, font=self.f(small),
+                               text="point at something white or grey, then press GREY CARD"))
+
+        # Preview on the right, controls on the left: no overlap, nothing
+        # competing for the same pixels.
+        pv_w = int(W * 0.40)
+        pv_h = int(pv_w * 0.75)
+        pv_x = W - pv_w - pad
+        pv_y = pad + int(title * 3.2)
+        z.append(c.create_rectangle(pv_x - 2, pv_y - 2, pv_x + pv_w + 2,
+                                    pv_y + pv_h + 2, outline=EDGE, width=2))
+        self.cal_thumb = c.create_image(pv_x + pv_w / 2, pv_y + pv_h / 2)
         z.append(self.cal_thumb)
-        self.cal_thumb_dims = (tw, th)
+        self.cal_thumb_dims = (pv_w, pv_h)
+
+        # The square the grey card reads from, drawn so the operator can fill it.
+        rs = int(min(pv_w, pv_h) * 0.22)
+        z.append(c.create_rectangle(pv_x + pv_w / 2 - rs, pv_y + pv_h / 2 - rs,
+                                    pv_x + pv_w / 2 + rs, pv_y + pv_h / 2 + rs,
+                                    outline="#9ccc65", width=2, dash=(5, 4)))
+        self.cal_text = c.create_text(pv_x + pv_w / 2, pv_y + pv_h + small * 2,
+                                      fill="#9ccc65", font=self.f(small, True),
+                                      text="")
+        z.append(self.cal_text)
+
+        # One row per control, each a wide readout between two big buttons.
+        col_w = pv_x - pad * 2
+        top = pv_y
+        row_h = int((H * 0.60) / len(self.COLOUR_ROWS))
+        btn = max(int(row_h * 0.62), 40)
+        self.colour_readouts = {}
+        for i, (label, kind, idx, step, lo, hi) in enumerate(self.COLOUR_ROWS):
+            y = top + i * row_h
+            z.append(c.create_text(pad, y, anchor="nw", text=label,
+                                   fill="#eceff1", font=self.f(row_f, True)))
+            by = y + row_f * 1.6
+            self._pill(pad, by, btn, "\u2212", "#37474f",
+                       lambda k=kind, ix=idx, st=step, l=lo, h2=hi:
+                       self._colour_set(k, ix, self._colour_value(k, ix) - st, l, h2), z)
+            self._pill(pad + col_w - btn, by, btn, "+", "#37474f",
+                       lambda k=kind, ix=idx, st=step, l=lo, h2=hi:
+                       self._colour_set(k, ix, self._colour_value(k, ix) + st, l, h2), z)
+            r = c.create_text(pad + col_w / 2, by + btn / 2, text="",
+                              fill="#80cbc4", font=self.f(row_f, True))
+            z.append(r)
+            self.colour_readouts[label] = (r, kind, idx)
+
+        by = H - pad - btn
         bs = max(11, int(H / 40))
-        bx = x0 + 10
-        if self.cal_step:
-            self.button(bx, y0 + ph - 8, "\u2039 BACK", "#455a64", self.cal_back, bs,
-                        store=z, anchor="sw")
-            bx += self.text_w("\u2039 BACK", bs, True) + 44
-        if colour is not None and name != "GREEN":
-            self.button(bx, y0 + ph - 8, "AUTO", "#00695c", self.cal_auto, bs,
-                        store=z, anchor="sw")
-            bx += self.text_w("AUTO", bs, True) + 44
-        if name == "AIM":
-            self.button(bx, y0 + ph - 8, "RUN ALL \u25b6", "#6a1b9a", self.cal_run_all, bs,
-                        store=z, anchor="sw")
-        if name == "DONE":
-            self.button(x0 + pw - 10, y0 + ph - 8, "SAVE  \u2713", "#2e7d32",
-                        self.cal_save, bs, store=z, anchor="se")
-        else:
-            self.button(x0 + pw - 10, y0 + ph - 8, "NEXT  \u203a", "#1565c0",
-                        self.cal_next, bs, store=z, anchor="se")
-        self.button(W - 8, 8, "\u2715", "#c62828",
-                    lambda: self.set_stage(self.STAGE_TUNE), bs, store=z, anchor="ne")
+        actions = [("GREY CARD", "#00695c", self.cal_grey_card),
+                   ("AUTO", "#455a64", self.cal_auto_wb),
+                   ("RESET", "#5d4037", self.cal_reset),
+                   ("SAVE \u2713", "#2e7d32", self.cal_save)]
+        widths = [self.text_w(t, bs, True) + 40 for t, _, _ in actions]
+        gap = max(8, int((W - pad * 2 - sum(widths)) / (len(actions) - 1)))
+        x = pad
+        for (label, col, cb), w in zip(actions, widths):
+            self._pill(x, by, btn, label, col, cb, z, width=w)
+            x += w + gap
+
+        self.button(W - pad, pad, "\u2715", "#c62828",
+                    lambda: self.set_stage(self.STAGE_TUNE), bs,
+                    store=z, anchor="ne")
+
         self.cal_meas = None
         self.last_seq = -1
-        if self.cal_step == 1:                     # neutral step: AWB must not fight us
-            self._tune_clear_auto(0x02, "WHITE BAL")
+        self._refresh_colour_readouts()
 
-    def cal_run_all(self):
-        """Whole sequence unattended: the operator only keeps the probe on the
-        screen. Each step gets AUTO rounds, then advances; SAVE at the end."""
-        self._cal_all = True
-        self.cal_step = 1
-        self.set_stage(self.STAGE_CAL)
-        self._cal_all_tick()
+    def _pill(self, x, y, h, label, fill, cb, store, width=None):
+        w = width if width else h
+        r = self.canvas.create_rectangle(x, y, x + w, y + h, fill=fill,
+                                         outline="", width=0)
+        t = self.canvas.create_text(x + w / 2, y + h / 2, text=label,
+                                    fill="white",
+                                    font=self.f(max(11, int(h * 0.34)), True))
+        for item in (r, t):
+            self.canvas.tag_bind(item, "<Button-1>", lambda e: cb())
+        store.extend([r, t])
+        return r, t
 
-    def _cal_all_tick(self):
-        if not self._cal_all or self.stage != self.STAGE_CAL:
-            self._cal_all = False
+    def _refresh_colour_readouts(self):
+        if self.stage != self.STAGE_CAL:
             return
-        name = self.CAL_STEPS[self.cal_step][0]
-        if name == "DONE":
-            self._cal_all = False
-            self.cal_save()
+        for label, (item, kind, idx) in self.colour_readouts.items():
+            v = self._colour_value(kind, idx)
+            txt = "{:+.0f}".format(v) if kind == "bri" else "{:.2f}".format(v)
+            try:
+                self.canvas.itemconfigure(item, text=txt)
+            except Exception:
+                pass
+
+    def cal_grey_card(self):
+        """
+        Make the sampled square neutral. Three divisions, no inference.
+
+        This is how every camera has done white balance for decades, and it
+        works where the patch wizard did not because the operator supplies the
+        one thing the software cannot know: which part of the scene is
+        supposed to be colourless.
+        """
+        if self.cal_meas is None:
+            self.toast("NO PICTURE YET", WARN)
             return
-        rounds = 8 if name == "WHITE" else (4 if name != "GREEN" else 0)
-        if rounds:
-            self.root.after(900, lambda: self.cal_auto(rounds))
-        wait = 900 + rounds * 700 + 900
-        def advance():
-            if self._cal_all and self.stage == self.STAGE_CAL:
-                self.cal_next()
-                self._cal_all_tick()
-        self.root.after(wait, advance)
+        raw = self.cal_meas[0]                      # B,G,R means, uncorrected
+        if float(np.mean(raw)) < 12:
+            self.toast("TOO DARK \u2014 more light on the card", WARN, ms=2000)
+            return
+        if float(np.max(raw)) > 250:
+            self.toast("OVEREXPOSED \u2014 the card is clipping", WARN, ms=2000)
+            return
+        target = float(np.mean(raw))
+        self.pi_gains = [round(float(np.clip(target / max(v, 1e-3), 0.25, 4.0)), 3)
+                         for v in raw]
+        self.pi_matrix = None                       # a matrix would fight the gains
+        self.last_seq = -1
+        self._refresh_colour_readouts()
+        self.toast("WHITE BALANCE SET  R{:.2f} G{:.2f} B{:.2f}".format(
+            self.pi_gains[2], self.pi_gains[1], self.pi_gains[0]), OK, ms=2200)
 
-    def cal_next(self):
-        name = self.CAL_STEPS[self.cal_step][0]
-        if name in ("WHITE", "RED", "GREEN", "BLUE", "BLACK") and self.cal_meas is not None:
-            self.cal_perm[name] = self.cal_meas[0]          # raw B,G,R means
-        if self.cal_step < len(self.CAL_STEPS) - 1:
-            self.cal_step += 1
-            self.set_stage(self.STAGE_CAL)
+    def cal_auto_wb(self):
+        """Grey-world over the whole frame: no card needed, less exact."""
+        if self.cal_meas is None:
+            self.toast("NO PICTURE YET", WARN)
+            return
+        frame, _, _, _ = self.link.snapshot()
+        if frame is None:
+            self.toast("NO PICTURE YET", WARN)
+            return
+        means = frame.reshape(-1, 3).mean(axis=0)
+        if float(np.mean(means)) < 8:
+            self.toast("TOO DARK", WARN)
+            return
+        target = float(np.mean(means))
+        self.pi_gains = [round(float(np.clip(target / max(v, 1e-3), 0.25, 4.0)), 3)
+                         for v in means]
+        self.pi_matrix = None
+        self.last_seq = -1
+        self._refresh_colour_readouts()
+        self.toast("AUTO WHITE BALANCE APPLIED", OK, ms=1800)
 
-    def cal_back(self):
-        if self.cal_step > 0:
-            self.cal_step -= 1
-            self.set_stage(self.STAGE_CAL)
+    def cal_reset(self):
+        self.pi_gains = [1.0, 1.0, 1.0]
+        self.pi_chan = [0, 1, 2]
+        self.pi_matrix = None
+        self.pi_bright = 0.0
+        self.pi_sat = 1.0
+        self.last_seq = -1
+        self._refresh_colour_readouts()
+        self.toast("COLOUR RESET", OK, ms=1400)
 
     def _cal_measure(self, frame):
         """Mean B,G,R of the centre 40% of the decoded frame: raw and after
@@ -2691,105 +2803,30 @@ class App:
         return raw, cor
 
     def _cal_update(self, h, frame, seq):
+        """Refresh the preview and the sampled-square numbers."""
         if frame is None or seq == self.last_seq:
             return
         self.last_seq = seq
         img = cv2.rotate(frame, cv2.ROTATE_180) if self.rot180 else frame
         raw, cor = self._cal_measure(img)
         self.cal_meas = (raw, cor)
-        name = self.CAL_STEPS[self.cal_step][0]
-        txt = "camera raw  R {:3.0f} G {:3.0f} B {:3.0f}   |  shown  R {:3.0f} G {:3.0f} B {:3.0f}".format(
-            raw[2], raw[1], raw[0], cor[2], cor[1], cor[0])
-        txt += "\nsensor 5a/5b/5c = {:02x}/{:02x}/{:02x}  b1/b2 = {:02x}/{:02x}  b5 = {:02x}   Pi gains B{:.2f} R{:.2f}".format(
-            self._reg(0x5a, 0), self._reg(0x5b, 0), self._reg(0x5c, 0),
-            self._reg(0xb1, 0), self._reg(0xb2, 0), self._reg(0xb5, 0),
-            self.pi_gains[0], self.pi_gains[2])
+
         if self.cal_text:
-            self.canvas.itemconfigure(self.cal_text, text=txt)
+            # Only what the operator can act on: the square's colour now, and
+            # how far off neutral it still is.
+            spread = float(np.max(cor) - np.min(cor))
+            self.canvas.itemconfigure(
+                self.cal_text,
+                text="square  R {:3.0f}  G {:3.0f}  B {:3.0f}     off-neutral {:3.0f}"
+                     .format(cor[2], cor[1], cor[0], spread))
+
         tw, th = self.cal_thumb_dims
         small = cv2.resize(img, (tw, th), interpolation=cv2.INTER_AREA)
         small = self._pi_colour(small)
-        cv2.rectangle(small, (int(tw * 0.3), int(th * 0.3)),
-                      (int(tw * 0.7), int(th * 0.7)), (80, 255, 80), 1)
         rgb = cv2.cvtColor(small, cv2.COLOR_BGR2RGB)
         self.cal_thumb_photo = ImageTk.PhotoImage(Image.fromarray(rgb))
         if self.cal_thumb:
             self.canvas.itemconfigure(self.cal_thumb, image=self.cal_thumb_photo)
-
-    def cal_auto(self, rounds=5):
-        """One closed-loop iteration for the current step, repeated up to
-        `rounds` times 600 ms apart so each new setting reaches a frame."""
-        if self.cal_meas is None or self.stage != self.STAGE_CAL:
-            if self.stage == self.STAGE_CAL:
-                self.toast("NO CAMERA FRAME YET", WARN)
-            return
-        raw, cor = self.cal_meas
-        name = self.CAL_STEPS[self.cal_step][0]
-        done = False
-        if name == "WHITE":
-            b, g, r = raw
-            mx = max(b, g, r)
-            # Exposure before white balance: a clipped channel cannot be
-            # balanced by any gain. Land the brightest channel near 200.
-            if mx > 235 or mx < 150:
-                self._tune_clear_auto(0x01, "EXPOSURE")
-                self._tune_clear_auto(0x04, "GAIN")
-                exp = (self._reg(0x03, 1) << 8) | self._reg(0x04, 0xe8)
-                factor = max(0.5, min(1.6, 200.0 / max(mx, 1.0)))
-                exp = int(max(4, min(4095, exp * factor)))
-                self.tune["regs"][0x03] = exp >> 8
-                self._tune_write(0x03, exp >> 8)
-                self._tune_write(0x04, exp & 0xff)
-                self.save_cfg()
-                if rounds > 1:
-                    self.root.after(700, lambda: self.cal_auto(rounds - 1))
-                return
-            if min(b, g, r) < 8:
-                self.toast("TOO DARK TO BALANCE \u2014 more light or closer", WARN)
-                return
-            gr, gb = self._reg(0x5a, 0x40), self._reg(0x5c, 0x40)
-            nr = int(round(gr * g / max(r, 1.0)))
-            nb = int(round(gb * g / max(b, 1.0)))
-            nr_c, nb_c = max(0x10, min(0xff, nr)), max(0x10, min(0xff, nb))
-            self._tune_write(0x5a, nr_c)
-            self._tune_write(0x5c, nb_c)
-            # what the sensor cannot deliver, the Pi finishes
-            self.pi_gains = [round(min(4.0, max(0.25, nb / nb_c)), 3), 1.0,
-                             round(min(4.0, max(0.25, nr / nr_c)), 3)]
-            done = abs(r - g) < 4 and abs(b - g) < 4
-        elif name in ("GREY", "BLACK"):
-            target = 128 if name == "GREY" else 16
-            L = float(cor.mean())
-            err = target - L
-            if abs(err) < 6:
-                done = True
-            else:
-                prev = getattr(self, "_cal_prev", None)
-                if prev is not None and (L - prev) * self.cal_sign * getattr(self, "_cal_last_step", 0) < 0:
-                    self.cal_sign = -self.cal_sign      # register acts the other way
-                cur = self._reg(0xb5, 0)
-                cur_s = cur - 256 if cur > 127 else cur
-                step = int(max(-24, min(24, err / 2)))
-                self._cal_last_step = step
-                new = max(-128, min(127, cur_s + step * self.cal_sign)) & 0xff
-                self._tune_write(0xb5, new)
-                self._cal_prev = L
-        elif name in ("RED", "BLUE"):
-            b, g, r = cor
-            hi = max(b, g, r)
-            purity = (hi - min(b, g, r)) / max(hi, 1.0)
-            reg = 0xb2 if name == "RED" else 0xb1
-            if purity < 0.55 and self._reg(reg, 0x40) < 0x90:
-                self._tune_write(reg, self._reg(reg, 0x40) + 8)
-            elif purity > 0.9 and self._reg(reg, 0x40) > 0x20:
-                self._tune_write(reg, self._reg(reg, 0x40) - 8)
-            else:
-                done = True
-        self.save_cfg()
-        if not done and rounds > 1:
-            self.root.after(600, lambda: self.cal_auto(rounds - 1))
-        elif done:
-            self.toast("STEP {} OK \u2713".format(name), OK, ms=1200)
 
     def _cal_channel_check(self):
         """After RED/GREEN/BLUE: which camera channel answered each patch."""
@@ -2833,9 +2870,7 @@ class App:
                         + "  pi_gains={} chan={}\n".format(self.pi_gains, self.pi_chan))
         except Exception:
             pass
-        self.cal_step = 0
         self.cal_perm = {}
-        self._cal_all = False
         self.set_stage(self.STAGE_RUN)
         self.toast("CALIBRATION SAVED \u2713", OK, ms=1800)
 
