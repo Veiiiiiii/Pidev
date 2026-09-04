@@ -518,7 +518,13 @@ class ProbeLink:
         self.fw = ""                    # last firmware status string
         self.fw_ver = None              # (major, rev) from the ready line
         self.colour_mode = None         # probe's current colour mode, if told
-        self.raw_swap = False           # byte order for the raw stream
+        # OpenCV's COLOR_BGR5652BGR reads the pair low byte first; this
+        # sensor emits high byte first, measured by the DIAG scorer (hi-first
+        # 0.69 against lo-first 0.24). So the pair is swapped before handing it
+        # over. Getting this backwards is what produced the concentric rainbow
+        # contours: a smooth scene read at the wrong offset makes the low
+        # colour fields cycle instead of climb. Toggle live with X.
+        self.raw_swap = True            # byte order for the raw stream
         self.raw_stream = False         # probe is sending unconverted bytes
         self.test_pattern = False       # probe is sending synthetic bars
         self.calib_ok = None            # gyro calibration verdict, if told
@@ -1818,6 +1824,10 @@ class App:
                         # The measurement decided; apply it rather than
                         # asking anyone to interpret the picture.
                         self.link.send_byte(ord('0') + best)
+                        # The raw stream needs the same answer: mode 0 is
+                        # high-byte-first, which OpenCV needs swapped.
+                        if best in (0, 1):
+                            self.link.raw_swap = (best == 0)
                         self.toast("COLOUR MODE {} chosen automatically"
                                    .format(best), OK, ms=3000)
                     else:
