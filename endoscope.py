@@ -110,7 +110,7 @@ from PIL import Image, ImageTk
 
 CONFIG = os.path.join(os.path.expanduser("~"), ".config", "endoscope.json")
 SYNC = b"\xa5\x5a"
-APP_VER = "4.2"
+APP_VER = "4.3"
 
 TYPE_IMU = 1
 TYPE_FRAME = 2
@@ -519,6 +519,7 @@ class ProbeLink:
         self.fw_ver = None              # (major, rev) from the ready line
         self.colour_mode = None         # probe's current colour mode, if told
         self.sensor_preset = None       # (n, name) from the probe, if told
+        self.sensor_regs = ""           # register dump from the last preset ack
         # OpenCV's COLOR_BGR5652BGR reads the pair low byte first; this
         # sensor emits high byte first, measured by the DIAG scorer (hi-first
         # 0.69 against lo-first 0.24). So the pair is swapped before handing it
@@ -768,6 +769,7 @@ class ProbeLink:
                         "OK" if data.get("ok") else "WRITE FAILED",
                         data.get("pid", "?"), data.get("reg24", "?"))
                     self.sensor_preset = (int(data.get("n", 0)), nm)
+                    self.sensor_regs = str(data.get("regs", ""))
                     if "cm" in data:
                         self.colour_mode = int(data["cm"])
                 except (TypeError, ValueError):
@@ -793,6 +795,7 @@ class ProbeLink:
                 "fw_ver": self.fw_ver,
                 "colour_mode": self.colour_mode,
                 "sensor_preset": self.sensor_preset,
+                "sensor_regs": self.sensor_regs,
                 "raw_stream": self.raw_stream,
                 "test_pattern": self.test_pattern,
                 "calib_ok": self.calib_ok,
@@ -827,6 +830,7 @@ class SimLink:
         self.fw_ver = (3, 8)
         self.colour_mode = 1
         self.sensor_preset = (0, "rgb565 driver default")
+        self.sensor_regs = "14=10 22=57 24=a6 54=22 (sim)"
         self.calib_ok = True
         self.raw = None
         self.raw_seq = 0
@@ -930,6 +934,7 @@ class SimLink:
             return {"state": "online", "fw": self.fw, "calibrating": False,
                     "fw_ver": self.fw_ver, "colour_mode": self.colour_mode,
                     "sensor_preset": self.sensor_preset,
+                    "sensor_regs": self.sensor_regs,
                     "calib_ok": self.calib_ok, "raw_seq": self.raw_seq,
                     "camera_failed": False, "generation": self.generation,
                     "imu_age": now - self.imu_time if self.imu_time else 1e9,
@@ -1547,6 +1552,12 @@ class App:
         self.button(pad, H - pad - int(H * 0.055) - int(H * 0.170), "SENSOR",
                     "#5d4037", self.next_preset, max(10, int(H / 38)),
                     store=self.hud, anchor="sw")
+        # Sensor register dump from the last SENSOR press: lets the chip's
+        # real state be read off a photograph of the screen.
+        self.regs_item = self.canvas.create_text(
+            W * 0.21, H - pad, anchor="sw", text="", fill="#9ccc65",
+            font=self.f(max(9, int(H / 54))))
+        self.hud.append(self.regs_item)
 
         panel = int(min(W, H) * 0.33)
         px, py = W - panel - pad, pad
@@ -1637,7 +1648,7 @@ class App:
         h = self.link.health()
         fv = h.get("fw_ver")
         if fv is None or fv < (3, 7):
-            self.toast("PROBE FIRMWARE HAS NO SENSOR PRESETS \u2014 FLASH v3.7",
+            self.toast("PROBE FIRMWARE HAS NO SENSOR PRESETS \u2014 FLASH v3.9",
                        WARN, ms=2600)
             return
         if getattr(self, "awb", False):
@@ -1864,6 +1875,11 @@ class App:
                     names = {0: "RAW", 1: "BYTE-SWAP", 2: "YUV"}
                     self.toast("COLOUR MODE {} \u2014 {}".format(
                         cm, names.get(cm, "?")), OK, ms=1600)
+            regs = h.get("sensor_regs") or ""
+            if regs and regs != getattr(self, "_last_regs", None) and \
+                    getattr(self, "regs_item", None):
+                self._last_regs = regs
+                self.canvas.itemconfigure(self.regs_item, text="SENSOR REGS  " + regs)
             sp = h.get("sensor_preset")
             if sp is not None and sp != getattr(self, "_last_sp", None):
                 prev_sp = getattr(self, "_last_sp", None)
