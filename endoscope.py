@@ -188,7 +188,33 @@ def clamp(x, lo=-1.0, hi=1.0):
 H_EPS = 1e-3
 
 
-def aim_angles(q_now, q_ref, axis_idx):
+def grey_world(bgr, prev_gains, clamp=2.6, smooth=0.15):
+    """
+    Correct the GC0308's colour cast by equalising the channel means.
+
+    Measured on a real frame from this probe: red 148, green 153, blue 67,
+    with red/green correlated at 0.97 and blue still correlated at 0.65 with
+    the image structure. All three channels therefore carry the correct
+    picture and blue is simply starved -- a gain fault, not a pixel-format
+    fault. That is why none of the byte-order or YUV modes ever helped: they
+    were attacking a problem that was not there.
+
+    Gains are clamped so a genuinely single-coloured scene (staring into a
+    red pipe) cannot be bleached to grey, and smoothed over time so the
+    picture does not pulse as the view changes.
+    """
+    small = bgr[::8, ::8].reshape(-1, 3).astype(np.float32)
+    means = small.mean(0)
+    if float(means.mean()) < 4.0:            # near-black frame: leave it alone
+        return bgr, prev_gains
+    gains = np.clip(means.mean() / np.maximum(means, 1e-3), 1.0 / clamp, clamp)
+    if prev_gains is not None:
+        gains = prev_gains + smooth * (gains - prev_gains)
+    out = np.clip(bgr.astype(np.float32) * gains, 0, 255).astype(np.uint8)
+    return out, gains
+
+
+def aim_angles(q_now, q_ref, axis_idx, el_sign=1.0):
     """
     Return (azimuth, elevation) in radians.
 
@@ -196,10 +222,19 @@ def aim_angles(q_now, q_ref, axis_idx):
     Azimuth is measured from the heading captured at zero time, positive to
     the operator's right, because heading has no absolute reference available
     in a steel environment.
+
+    el_sign is the saved up/down polarity, +1 or -1. It exists because the
+    lens axis and its antipode produce IDENTICAL azimuth -- negating the
+    forward vector negates both the reference and the current heading, so the
+    cross and dot products that define azimuth are unchanged -- while
+    elevation flips. Up/down reversed with left/right still correct is
+    therefore always this one bit, and nothing else. Applying it here, last,
+    means neither the axis detector nor a re-zero can silently undo the
+    operator's correction.
     """
     fwd = AXES[axis_idx][1]
     v = v_norm(q_rotate(q_now, fwd))
-    el = math.asin(clamp(v[2]))
+    el = math.asin(clamp(v[2])) * el_sign
 
     if q_ref is None:
         return 0.0, el
@@ -931,6 +966,11 @@ class App:
         self._hint_state = ""           # wait / armed / locked
         self._last_cm = None            # last colour mode we toasted about
         self.rot180 = bool(self.cfg.get("rot180", True))
+        # Up/down polarity, set once with FLIP U/D and never touched
+        # by zeroing or by the axis detector.
+        self.el_sign = -1.0 if self.cfg.get("el_sign", 1) < 0 else 1.0
+        self.awb = bool(self.cfg.get("awb", True))
+        self._awb_gains = None
         self.diag_photo = None          # sticky DIAG grid, shown over video
         self._raw_seen = 0
         self.stage = self.STAGE_SETUP
@@ -995,7 +1035,9 @@ class App:
             os.makedirs(os.path.dirname(CONFIG), exist_ok=True)
             with open(CONFIG, "w", encoding="utf-8") as f:
                 json.dump({"axis": self.axis_idx,
-                           "rot180": self.rot180}, f)
+                           "rot180": self.rot180,
+                           "el_sign": self.el_sign,
+                           "awb": self.awb}, f)
         except Exception:
             pass
 
@@ -1307,22 +1349,20 @@ class App:
 
     def flip_axis(self):
         """
-        Swap the lens axis for its antipode. Up/down reading exactly inverted
-        while left/right stays correct means precisely this: the selected axis
-        is the BACKWARD one (a tilt-down slipped into the detection gesture,
-        or an old inverted lock is still saved in the config). One tap fixes
-        the saved state; no re-zero needed, the reference pose is still valid.
-        AXES is ordered in antipodal pairs, so the partner is index XOR 1.
+        Invert the up/down reading, and keep it inverted.
+
+        v3.3 flipped the lens axis to its antipode instead. That is the same
+        maths -- polarity only moves elevation -- but it lived in the axis
+        field, so the next ZERO let the tilt-up detector relock a polarity of
+        its own choosing and the correction vanished. The operator saw it come
+        back wrong every session. The sign now lives in its own saved field
+        that only this button writes.
         """
-        self.axis_auto = False
-        self.axis_idx ^= 1
+        self.el_sign = -self.el_sign
         self.save_cfg()
         self.peak_az = 0.0
-        if self.axis_btn_text:
-            self.canvas.itemconfigure(self.axis_btn_text,
-                                      text="AXIS " + AXES[self.axis_idx][0])
-        self.toast("AXIS FLIPPED: " + AXES[self.axis_idx][0] + " \u2713",
-                   OK, ms=2000)
+        self.toast("UP/DOWN " + ("NORMAL" if self.el_sign > 0 else "INVERTED")
+                   + " \u2713", OK, ms=2000)
 
     def cycle_axis(self):
         # A manual choice wins over the detector until the next ZERO/RE-ZERO,
@@ -1447,6 +1487,15 @@ class App:
             self.flip_axis()
         elif k == "d" and self.stage == self.STAGE_RUN:
             self.toggle_diag()
+        elif k == "w" and self.stage == self.STAGE_RUN:
+            # Escape hatch: if a scene really is one colour, AWB will bleach
+            # it, and the operator needs to be able to see the sensor plain.
+            self.awb = not self.awb
+            self._awb_gains = None
+            self.save_cfg()
+            self.last_seq = -1
+            self.toast("AUTO WHITE BALANCE: " + ("ON" if self.awb else "OFF"),
+                       OK, ms=1400)
         elif k == "v" and self.stage == self.STAGE_RUN:
             self.rot180 = not self.rot180
             self.save_cfg()
@@ -1493,7 +1542,7 @@ class App:
     def update(self):
         frame, seq, q, still = self.link.snapshot()
         h = self.link.health()
-        az, el = aim_angles(q, self.q_ref, self.axis_idx)
+        az, el = aim_angles(q, self.q_ref, self.axis_idx, self.el_sign)
         self._log_row(az, el, q, still)
 
         # A probe restart (new generation) restarts its orientation estimate,
@@ -1538,7 +1587,7 @@ class App:
                         self.save_cfg()
                         # Heading is defined per-axis, so recompute this
                         # frame's angles and restart the drift peak.
-                        az, el = aim_angles(q, self.q_ref, self.axis_idx)
+                        az, el = aim_angles(q, self.q_ref, self.axis_idx, self.el_sign)
                         self.peak_az = 0.0
                         self.toast("LENS AXIS AUTO-SET: "
                                    + AXES[hit][0] + " \u2713", OK, ms=2400)
@@ -1598,6 +1647,8 @@ class App:
                 scale = min(self.W / fw, self.H / fh)
                 small = cv2.resize(show, (int(fw * scale), int(fh * scale)),
                                    interpolation=cv2.INTER_LINEAR)
+                if self.awb and self.diag_photo is None:
+                    small, self._awb_gains = grey_world(small, self._awb_gains)
                 rgb = cv2.cvtColor(small, cv2.COLOR_BGR2RGB)
                 self.photo = ImageTk.PhotoImage(Image.fromarray(rgb))
                 self.canvas.itemconfigure(self.video_item, image=self.photo)
@@ -1623,6 +1674,8 @@ class App:
             bits = ["{:.0f} fps".format(h["fps"])]
             if self.rot180:
                 bits.append("ROT180")
+            if self.awb:
+                bits.append("AWB")
             if self.diag_photo is not None:
                 bits.append("DIAG")
             if h["state"] != "online":
