@@ -110,7 +110,7 @@ from PIL import Image, ImageTk
 
 CONFIG = os.path.join(os.path.expanduser("~"), ".config", "endoscope.json")
 SYNC = b"\xa5\x5a"
-APP_VER = "4.1"
+APP_VER = "4.2"
 
 TYPE_IMU = 1
 TYPE_FRAME = 2
@@ -761,8 +761,13 @@ class ProbeLink:
                     pass
             elif st == "sensor_preset":
                 try:
-                    self.sensor_preset = (int(data.get("n", 0)),
-                                          str(data.get("name", "")))
+                    # Carry the probe's proof along: did the register writes
+                    # land (readback), and does the bus see the sensor (PID)?
+                    nm = "{} \u00b7 {} pid {} r24 {}".format(
+                        data.get("name", ""),
+                        "OK" if data.get("ok") else "WRITE FAILED",
+                        data.get("pid", "?"), data.get("reg24", "?"))
+                    self.sensor_preset = (int(data.get("n", 0)), nm)
                     if "cm" in data:
                         self.colour_mode = int(data["cm"])
                 except (TypeError, ValueError):
@@ -819,7 +824,7 @@ class SimLink:
         self.still = False
         self.state = "online"
         self.fw = "ready"
-        self.fw_ver = (3, 7)
+        self.fw_ver = (3, 8)
         self.colour_mode = 1
         self.sensor_preset = (0, "rgb565 driver default")
         self.calib_ok = True
