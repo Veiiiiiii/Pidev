@@ -548,6 +548,95 @@ def find_port(preferred=None):
     return None
 
 
+class V4L2Source:
+    """
+    Video from a standard UVC camera, read by V4L2 through OpenCV.
+
+    This exists because the custom video path should never have been built.
+    The AtomS3R-CAM ships as a UVC device: plug it in and the Pi gives you
+    /dev/video0 with correct colour, decoded by the kernel and OpenCV. Flashing
+    custom firmware to get the IMU took that away, and everything that followed
+    -- a serial protocol, JPEG encoding on an ESP32, RGB565 unpacking, white
+    balance, black point, gamma -- was rebuilding what UVC had provided for
+    free. Every colour fault in this project lives in that rebuilt code.
+
+    With a UVC camera supplying the picture and the probe supplying only
+    attitude, none of that code runs at all.
+    """
+
+    def __init__(self, index, width=1280, height=720):
+        self.index = index
+        self.want = (width, height)
+        self.cap = None
+        self.lock = threading.Lock()
+        self.frame = None
+        self.frame_seq = 0
+        self.frame_time = 0.0
+        self.running = False
+        self.error = None
+        self._fps = []
+
+    def start(self):
+        src = self.index
+        if isinstance(src, str) and src.isdigit():
+            src = int(src)
+        self.cap = cv2.VideoCapture(src)
+        if not self.cap.isOpened():
+            raise RuntimeError("cannot open camera {}. Try: ls /dev/video*"
+                               .format(self.index))
+        # MJPG first: at 720p a YUYV stream will not fit down USB 2.0 at a
+        # usable frame rate, and most UVC cameras offer both.
+        self.cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
+        self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.want[0])
+        self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.want[1])
+        self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+        ok, _ = self.cap.read()
+        if not ok:
+            raise RuntimeError("camera {} opened but returns no frames"
+                               .format(self.index))
+        self.running = True
+        threading.Thread(target=self._loop, daemon=True).start()
+        return self
+
+    def _loop(self):
+        while self.running:
+            ok, frame = self.cap.read()
+            if not ok:
+                time.sleep(0.05)
+                continue
+            now = time.monotonic()
+            with self.lock:
+                self.frame = frame
+                self.frame_seq += 1
+                self.frame_time = now
+                self._fps.append(now)
+
+    def fps(self):
+        now = time.monotonic()
+        with self.lock:
+            self._fps = [t for t in self._fps if now - t < 2.0]
+            return len(self._fps) / 2.0
+
+    def snapshot(self):
+        """
+        Attitude always comes from the probe. Video comes from the UVC camera
+        when one is attached, so none of the probe's colour handling is in the
+        path at all.
+        """
+        if self.camera is not None:
+            frame, seq, _ = self.camera.snapshot()
+            with self.lock:
+                return frame, seq, self.quat, self.still
+        with self.lock:
+            return self.frame, self.frame_seq, self.quat, self.still
+
+    def stop(self):
+        self.running = False
+        time.sleep(0.05)
+        if self.cap:
+            self.cap.release()
+
+
 class ProbeLink:
     """
     Owns the USB connection on a background thread: finds the port, opens it,
@@ -598,6 +687,7 @@ class ProbeLink:
         # colour fields cycle instead of climb. Toggle live with X.
         self.raw_swap = True            # byte order for the raw stream
         self.raw_stream = False         # probe is sending unconverted bytes
+        self.camera = None              # optional UVC source, overrides video
         self.test_pattern = False       # probe is sending synthetic bars
         self.calib_ok = None            # gyro calibration verdict, if told
         self.raw = None                 # last raw frame for the DIAG grid
@@ -910,7 +1000,9 @@ class ProbeLink:
                 "camera_failed": self.camera_failed,
                 "generation": self.generation,
                 "imu_age": now - self.imu_time if self.imu_time else 1e9,
-                "frame_age": now - self.frame_time if self.frame_time else 1e9,
+                "frame_age": ((now - self.camera.frame_time)
+                              if self.camera is not None and self.camera.frame_time
+                              else (now - self.frame_time if self.frame_time else 1e9)),
                 "fps": len(self._fps) / 2.0,
                 "bad": self.bad_packets,
                 "port": self.port,
@@ -1072,7 +1164,9 @@ class SimLink:
                     "calib_ok": self.calib_ok, "raw_seq": self.raw_seq,
                     "camera_failed": False, "generation": self.generation,
                     "imu_age": now - self.imu_time if self.imu_time else 1e9,
-                    "frame_age": now - self.frame_time if self.frame_time else 1e9,
+                    "frame_age": ((now - self.camera.frame_time)
+                              if self.camera is not None and self.camera.frame_time
+                              else (now - self.frame_time if self.frame_time else 1e9)),
                     "fps": 12.5, "bad": 0, "port": "sim"}
 
 
@@ -2134,13 +2228,14 @@ class App:
                 scale = min(self.W / fw, self.H / fh)
                 small = cv2.resize(show, (int(fw * scale), int(fh * scale)),
                                    interpolation=cv2.INTER_LINEAR)
-                if self.swap_rb and self.diag_photo is None:
+                uvc = self.link.camera is not None
+                if self.swap_rb and self.diag_photo is None and not uvc:
                     # A red/blue transposition survives JPEG intact, so unlike
                     # a bit-order fault it can still be undone here.
                     small = small[:, :, ::-1]
                 if self.diag_photo is None:
                     small = self._pi_colour(small)
-                if self.awb and self.diag_photo is None:
+                if self.awb and self.diag_photo is None and not uvc:
                     small, self._awb_gains = grey_world(small, self._awb_gains)
                 rgb = cv2.cvtColor(small, cv2.COLOR_BGR2RGB)
                 self.photo = ImageTk.PhotoImage(Image.fromarray(rgb))
@@ -2167,7 +2262,9 @@ class App:
             bits = ["{:.0f} fps".format(h["fps"])]
             if self.rot180:
                 bits.append("ROT180")
-            if self.awb:
+            if self.link.camera is not None:
+                bits.append("UVC")
+            elif self.awb:
                 bits.append("AWB")
             if h.get("raw_stream"):
                 bits.append("RAW" + ("~" if self.link.raw_swap else ""))
@@ -3007,6 +3104,13 @@ def main():
     ap = argparse.ArgumentParser(description="Endoscope viewer with aim indicator")
     ap.add_argument("--port", help="e.g. /dev/ttyACM0 (auto-detected if omitted)")
     ap.add_argument("--baud", type=int, default=115200)
+    ap.add_argument("--video", metavar="N",
+                    help="take video from a standard UVC camera instead of the "
+                         "probe, e.g. --video 0 or --video /dev/video0. The "
+                         "probe then supplies attitude only, and none of the "
+                         "firmware colour handling is in the picture path.")
+    ap.add_argument("--video-size", default="1280x720",
+                    help="requested UVC capture size (default 1280x720)")
     ap.add_argument("--windowed", action="store_true")
     ap.add_argument("--sim", action="store_true",
                     help="synthetic probe: run the whole UI with no hardware")
@@ -3019,6 +3123,8 @@ def main():
     try:
         app.run()
     finally:
+        if getattr(link, 'camera', None):
+            link.camera.stop()
         link.stop()
         if link.status:
             print("\nProbe reported:")
