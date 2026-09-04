@@ -1363,6 +1363,7 @@ class App:
         self.pi_gamma = [float(x) for x in cal.get("gamma", [1.0, 1.0, 1.0])]
         self._lut = None
         self.cal_group = 0
+        self.cal_prim = {}      # measured R,G,B primaries for the matrix
         self.pi_bright = float(cal.get("bright", 0.0))    # -80 .. +80, added
         self.pi_sat = float(cal.get("sat", 1.0))          # 0 .. 2, multiplies
         self.pi_matrix = cal.get("matrix")           # 4x3 colour correction, or None
@@ -2705,16 +2706,15 @@ class App:
 
     def _pi_colour(self, img):
         """
-        Channel map, then levels + gamma + gain through a LUT, then brightness
-        and saturation. White balance has to land before saturation or a cast
-        gets amplified along with the colour you wanted.
+        Channel map, then levels/gamma/gain, then the colour matrix, then
+        brightness and saturation.
+
+        Order is not arbitrary. The matrix is solved from primaries measured
+        after the levels correction, so it has to be applied in that same
+        space or it is describing a picture that no longer exists.
         """
         if self.pi_chan != [0, 1, 2]:
             img = img[:, :, self.pi_chan]
-        if self.pi_matrix:
-            M = np.array(self.pi_matrix, np.float32)          # 4x3: B,G,R,offset
-            flat = img.reshape(-1, 3).astype(np.float32)
-            img = np.clip(flat @ M[:3] + M[3], 0, 255).astype(np.uint8).reshape(img.shape)
 
         if self._levels_active():
             lut = self._lut if self._lut is not None else self._build_lut()
@@ -2722,6 +2722,12 @@ class App:
             for ch in range(3):
                 out[:, :, ch] = lut[:, ch][img[:, :, ch]]
             img = out
+
+        if self.pi_matrix:
+            M = np.array(self.pi_matrix, np.float32)          # 4x3: B,G,R,offset
+            flat = img.reshape(-1, 3).astype(np.float32)
+            img = np.clip(flat @ M[:3] + M[3], 0,
+                          255).astype(np.uint8).reshape(img.shape)
 
         need_bri = abs(self.pi_bright) > 0.5
         need_sat = abs(self.pi_sat - 1.0) > 0.01
@@ -2844,7 +2850,7 @@ class App:
 
         rows = self.COLOUR_GROUPS[self.cal_group][1]
         top = gy + int(btn * 0.8) + pad
-        avail = (H - pad - btn - pad) - top
+        avail = (H - pad - btn * 2 - int(pad * 1.6)) - top
         row_h = int(avail / max(len(rows), 1))
         rb = min(btn, max(34, int(row_h * 0.72)))
         self.colour_readouts = {}
@@ -2864,19 +2870,29 @@ class App:
             z.append(r)
             self.colour_readouts[label] = (r, kind, idx)
 
-        by = H - pad - btn
         bs = max(10, int(H / 44))
-        actions = [("BLACK", "#263238", self.cal_set_black),
+        row2 = H - pad - btn
+        row1 = row2 - btn - int(pad * 0.6)
+
+        def bar(y, items):
+            widths = [self.text_w(t, bs, True) + 28 for t, _, _ in items]
+            gap = max(6, int((W - pad * 2 - sum(widths)) / max(len(items) - 1, 1)))
+            x = pad
+            for (label, col, cb), w in zip(items, widths):
+                self._pill(x, y, btn, label, col, cb, z, width=w)
+                x += w + gap
+
+        # Neutrals first: these alone fix a cast, and are all most sensors need.
+        bar(row1, [("BLACK", "#263238", self.cal_set_black),
                    ("WHITE", "#546e7a", self.cal_set_white),
                    ("GREY", "#00695c", self.cal_set_grey),
                    ("RESET", "#5d4037", self.cal_reset),
-                   ("SAVE \u2713", "#2e7d32", self.cal_save)]
-        widths = [self.text_w(t, bs, True) + 30 for t, _, _ in actions]
-        gap = max(6, int((W - pad * 2 - sum(widths)) / (len(actions) - 1)))
-        x = pad
-        for (label, col, cb), w in zip(actions, widths):
-            self._pill(x, by, btn, label, col, cb, z, width=w)
-            x += w + gap
+                   ("SAVE \u2713", "#2e7d32", self.cal_save)])
+        # Primaries second: only for hue errors that survive the neutrals.
+        bar(row2, [("RED", "#b71c1c", lambda: self.cal_set_primary("R")),
+                   ("GREEN", "#1b5e20", lambda: self.cal_set_primary("G")),
+                   ("BLUE", "#0d47a1", lambda: self.cal_set_primary("B")),
+                   ("NO MATRIX", "#37474f", self.cal_clear_matrix)])
 
         self.button(W - pad, pad, "\u2715", "#c62828",
                     lambda: self.set_stage(self.STAGE_TUNE), bs,
@@ -2924,15 +2940,47 @@ class App:
             self.toast("NO PICTURE YET", WARN)
             return None
         raw = self.cal_meas[0]
-        if what == "black" and float(np.max(raw)) > 90:
-            self.toast("NOT DARK ENOUGH \u2014 cover the lens", WARN, ms=2200)
-            return None
-        if what != "black" and float(np.mean(raw)) < 12:
-            self.toast("TOO DARK \u2014 more light on the card", WARN, ms=2200)
-            return None
+        if what == "black":
+            # Brightness is the wrong test here. Whatever the sensor still
+            # reads with the lens covered IS the black level -- on this GC0308
+            # that is a green-tinted value well above zero, and rejecting it
+            # for being too bright threw away the very measurement wanted.
+            # A covered lens is FLAT; a real scene has texture. Judge that.
+            flat = self.cal_meas[2] if len(self.cal_meas) > 2 else None
+            if flat is not None and flat > 14.0:
+                self.toast("LENS NOT COVERED \u2014 the square still has "
+                           "detail in it", WARN, ms=2400)
+                return None
+        flat = self.cal_meas[2] if len(self.cal_meas) > 2 else 0.0
+
+        if what != "black":
+            if float(np.mean(raw)) < 12:
+                self.toast("TOO DARK \u2014 more light on the card", WARN, ms=2200)
+                return None
+            if flat > 20.0:
+                # A card fills the square evenly. Texture in it means the
+                # square is seeing something else as well, and the average
+                # would then describe neither.
+                self.toast("SQUARE NOT FILLED \u2014 move closer so the card "
+                           "covers it", WARN, ms=2600)
+                return None
         if what == "white" and float(np.max(raw)) > 250:
-            self.toast("OVEREXPOSED \u2014 less light, or angle away", WARN, ms=2200)
+            # A clipped channel has lost its true value, so it cannot define
+            # the top of the curve.
+            self.toast("OVEREXPOSED \u2014 less light, or tilt the card away",
+                       WARN, ms=2400)
             return None
+        if what == "grey":
+            lo = np.array(self.pi_black, np.float32)
+            hi = np.array(self.pi_white, np.float32)
+            n = np.clip((raw - lo) / np.maximum(hi - lo, 1e-3), 0, 1)
+            if float(np.mean(n)) < 0.12 or float(np.mean(n)) > 0.88:
+                # Solving gamma from a near-black or near-white patch gives a
+                # wild exponent from almost no signal.
+                self.toast("NOT MID GREY \u2014 it reads {:.0f}% of the way "
+                           "from black to white".format(float(np.mean(n)) * 100),
+                           WARN, ms=2800)
+                return None
         return raw
 
     def cal_set_black(self):
@@ -2980,6 +3028,60 @@ class App:
         self._after_capture("MID SET  gamma R{:.2f} G{:.2f} B{:.2f}".format(
             gam[2], gam[1], gam[0]))
 
+    def cal_set_primary(self, which):
+        """
+        Capture one primary. Three of them define a colour matrix.
+
+        Black, white and grey fix each channel's own curve, which is enough
+        whenever the fault is a cast. They cannot fix cross-talk -- red light
+        landing partly in the green channel -- because that is a relationship
+        between channels, not a level within one. If neutrals come out neutral
+        and hues are still wrong, that is the remaining fault, and only a
+        matrix addresses it.
+        """
+        raw = self._cal_patch("primary")
+        if raw is None:
+            return
+        # Measured in the levels-corrected space, which is where the matrix
+        # will be applied.
+        corrected = self._pi_colour(
+            np.full((4, 4, 3), raw, dtype=np.uint8)).reshape(-1, 3).mean(axis=0)
+        self.cal_prim[which] = [float(v) for v in corrected]
+        have = "".join(k for k in "RGB" if k in self.cal_prim)
+        self.toast("{} CAPTURED  ({} of RGB done)".format(which, len(have)),
+                   OK, ms=2000)
+        if len(self.cal_prim) == 3:
+            self._solve_matrix()
+
+    def _solve_matrix(self):
+        """
+        Solve M so the three measured primaries map onto pure red, green and
+        blue. Refused if the measurements are nearly parallel, because
+        inverting that produces enormous coefficients and a garish picture.
+        """
+        try:
+            P = np.array([self.cal_prim["B"], self.cal_prim["G"],
+                          self.cal_prim["R"]], np.float32).T      # BGR columns
+            T = np.eye(3, dtype=np.float32) * 255.0
+            if abs(float(np.linalg.det(P))) < 1e3:
+                self.toast("PRIMARIES TOO ALIKE \u2014 recapture with stronger "
+                           "colours", WARN, ms=2800)
+                return
+            M = (T @ np.linalg.inv(P)).T
+            if float(np.abs(M).max()) > 6.0:
+                self.toast("MATRIX UNSTABLE \u2014 ignoring it", WARN, ms=2600)
+                return
+            self.pi_matrix = [[float(v) for v in row] for row in M] + [[0.0, 0.0, 0.0]]
+            self._after_capture("COLOUR MATRIX SET from R, G and B")
+        except Exception as e:
+            self.toast("MATRIX FAILED: {}".format(e), WARN, ms=2600)
+
+    def cal_clear_matrix(self):
+        self.pi_matrix = None
+        self.cal_prim = {}
+        self.last_seq = -1
+        self.toast("COLOUR MATRIX CLEARED \u2014 neutrals only", OK, ms=1800)
+
     def _after_capture(self, msg):
         self.pi_matrix = None                  # a matrix would fight the curve
         self._lut = None
@@ -3008,7 +3110,10 @@ class App:
         roi = frame[int(fh * 0.3):int(fh * 0.7), int(fw * 0.3):int(fw * 0.7)]
         raw = roi.reshape(-1, 3).mean(axis=0)
         cor = self._pi_colour(roi).reshape(-1, 3).mean(axis=0)
-        return raw, cor
+        # Spatial spread of the patch: near zero when the lens is covered or
+        # aimed at a card, large when it is looking at a scene.
+        flat = float(roi.reshape(-1, 3).mean(axis=1).std())
+        return raw, cor, flat
 
     def _cal_update(self, h, frame, seq):
         """Refresh the preview and the sampled-square numbers."""
@@ -3016,8 +3121,8 @@ class App:
             return
         self.last_seq = seq
         img = cv2.rotate(frame, cv2.ROTATE_180) if self.rot180 else frame
-        raw, cor = self._cal_measure(img)
-        self.cal_meas = (raw, cor)
+        raw, cor, flat = self._cal_measure(img)
+        self.cal_meas = (raw, cor, flat)
 
         if self.cal_text:
             # Only what the operator can act on: the square's colour now, and
