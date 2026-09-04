@@ -110,7 +110,7 @@ from PIL import Image, ImageTk
 
 CONFIG = os.path.join(os.path.expanduser("~"), ".config", "endoscope.json")
 SYNC = b"\xa5\x5a"
-APP_VER = "4.5"
+APP_VER = "4.6"
 
 TYPE_IMU = 1
 TYPE_FRAME = 2
@@ -472,6 +472,70 @@ def build_diag_grid(raw, width, height, save_dir=None):
     return grid, best[5], report
 
 
+
+def analyze_bars(raw, width, height):
+    """
+    Judge the sensor's internal colour bars. Each bar should be a corner of
+    the RGB cube (every channel near 0 or near full). That is independent of
+    bar order and of any white balance, because the pattern is generated
+    inside the chip: it tests only the parallel data path and the unpack.
+    Returns (image, verdict_text, passed).
+    """
+    if len(raw) < width * height * 2:
+        return None, "raw frame too short", False
+    buf = np.frombuffer(raw, dtype=np.uint8, count=width * height * 2).reshape(height, width, 2)
+    w16 = (buf[:, :, 0].astype(np.uint16) << 8) | buf[:, :, 1].astype(np.uint16)
+    r = (((w16 >> 11) & 0x1F) << 3).astype(np.uint8)
+    g = (((w16 >> 5) & 0x3F) << 2).astype(np.uint8)
+    b = ((w16 & 0x1F) << 3).astype(np.uint8)
+    img = np.dstack([b, g, r])
+
+    def strips(vertical):
+        out = []
+        for i in range(8):
+            if vertical:
+                s = img[int(height * 0.2):int(height * 0.8),
+                        int(width * i / 8) + 4:int(width * (i + 1) / 8) - 4]
+            else:
+                s = img[int(height * i / 8) + 3:int(height * (i + 1) / 8) - 3,
+                        int(width * 0.2):int(width * 0.8)]
+            out.append(s.reshape(-1, 3).mean(axis=0))
+        return out
+
+    def score(means):
+        ok = 0
+        for m in means:
+            if all(v < 70 or v > 185 for v in m):
+                ok += 1
+        distinct = len({tuple(int(v > 128) for v in m) for m in means})
+        return ok, distinct
+
+    v_means, h_means = strips(True), strips(False)
+    v_ok, v_d = score(v_means)
+    h_ok, h_d = score(h_means)
+    means, ok, dist, orient = ((v_means, v_ok, v_d, "vertical")
+                               if (v_ok, v_d) >= (h_ok, h_d) else
+                               (h_means, h_ok, h_d, "horizontal"))
+    passed = ok >= 6 and dist >= 6
+
+    out = np.full((height * 2 + 150, max(width * 2, 900), 3), 16, np.uint8)
+    out[0:height * 2, 0:width * 2] = cv2.resize(img, (width * 2, height * 2),
+                                                interpolation=cv2.INTER_NEAREST)
+    sw = (width * 2) // 8
+    for i, m in enumerate(means):
+        x0 = i * sw
+        out[height * 2 + 10:height * 2 + 60, x0 + 4:x0 + sw - 4] = m.astype(np.uint8)
+        cv2.putText(out, "R%3d G%3d B%3d" % (m[2], m[1], m[0]), (x0 + 4, height * 2 + 80),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.38, (230, 235, 240), 1)
+    verdict = ("SENSOR BARS PASS  {}/8 clean, {} distinct ({}) -> data path OK; "
+               "the cast is colour processing".format(ok, dist, orient) if passed else
+               "SENSOR BARS FAIL  {}/8 clean, {} distinct ({}) -> data path suspect "
+               "(pins / PCLK / bit order)".format(ok, dist, orient))
+    cv2.putText(out, verdict, (8, height * 2 + 120), cv2.FONT_HERSHEY_SIMPLEX, 0.6,
+                (120, 235, 140) if passed else (110, 110, 250), 2)
+    return out, verdict, passed
+
+
 # ------------------------------------------------------------- serial link
 
 def find_port(preferred=None):
@@ -520,6 +584,7 @@ class ProbeLink:
         self.colour_mode = None         # probe's current colour mode, if told
         self.sensor_preset = None       # (n, name) from the probe, if told
         self.sensor_regs = ""           # register dump from the last preset ack
+        self.sensor_bars = None
         self.regs_dict = {}             # parsed {reg: val} from the last dump
         self.regs_seq = 0
         self.defaults = None            # first dump of this boot = driver defaults
@@ -797,6 +862,8 @@ class ProbeLink:
                                     bool(data.get("ok")))
                 except ValueError:
                     pass
+            elif st == "sensor_bars":
+                self.sensor_bars = (bool(data.get("on")), bool(data.get("ok")))
             elif st == "sensor_preset":
                 try:
                     # Carry the probe's proof along: did the register writes
@@ -1189,6 +1256,9 @@ class App:
         cal = self.cfg.get("cal") or {}
         self.pi_gains = [float(x) for x in cal.get("gains", [1.0, 1.0, 1.0])]  # B,G,R
         self.pi_chan = [int(x) for x in cal.get("chan", [0, 1, 2])]            # BGR index map
+        self.pi_matrix = cal.get("matrix")           # 4x3 colour correction, or None
+        self._bars_pending = False
+        self._cal_all = False
         self.cal_step = 0
         self.cal_meas = None
         self.cal_sign = 1
@@ -1285,7 +1355,8 @@ class App:
                            "awb": self.awb,
                            "swap_rb": self.swap_rb,
                            "tune": self.tune_saved,
-                           "cal": {"gains": self.pi_gains, "chan": self.pi_chan}}, f)
+                           "cal": {"gains": self.pi_gains, "chan": self.pi_chan,
+                                   "matrix": self.pi_matrix}}, f)
         except Exception:
             pass
 
@@ -2205,6 +2276,8 @@ class App:
                     self.tune_next_page, bs, store=z, anchor="sw")
         self.button(12 + int(W * 0.26), H - pad, "CAL WIZARD", "#00695c",
                     lambda: self.set_stage(self.STAGE_CAL), bs, store=z, anchor="sw")
+        self.button(12 + int(W * 0.44), H - pad, "BARS TEST", "#4e342e",
+                    self.tune_bars, bs, store=z, anchor="sw")
         self.button(W - pad, H - pad, "DONE  \u2713", "#2e7d32", self.tune_done,
                     bs, store=z, anchor="se")
 
@@ -2220,6 +2293,18 @@ class App:
         for item in (r, t):
             c.tag_bind(item, "<Button-1>", lambda e: cb())
         self.stage_items.extend((r, t))
+
+    def tune_bars(self):
+        """Sensor colour bars on -> one raw frame -> automatic verdict."""
+        h = self.link.health()
+        fv = h.get("fw_ver")
+        if fv is None or fv < (3, 11):
+            self.toast("FLASH FIRMWARE v3.11 FOR THE BARS TEST", WARN, ms=2400)
+            return
+        self._bars_pending = True
+        self.link.send_bytes(b"b")
+        self.root.after(900, lambda: self.link.send_bytes(b"r"))
+        self.toast("SENSOR BARS: capturing \u2026", DIM, ms=1500)
 
     def tune_next_page(self):
         self.tune_page = (self.tune_page + 1) % len(self.TUNE_PAGES)
@@ -2367,6 +2452,22 @@ class App:
         self._tune_refresh()
 
     def _tune_update(self, h, frame, seq):
+        if self._bars_pending and h.get("raw_seq", 0) != self._raw_seen:
+            raw, self._raw_seen = self.link.take_raw()
+            self._bars_pending = False
+            self.link.send_bytes(b"b")                       # bars off again
+            img, verdict, passed = analyze_bars(raw, 320, 240) if raw else (None, "no raw", False)
+            try:
+                with open(os.path.expanduser("~/endoscope_bars.txt"), "a", encoding="utf-8") as f:
+                    f.write(time.strftime("%Y-%m-%d %H:%M:%S  ") + verdict + "\n")
+            except Exception:
+                pass
+            if img is not None:
+                self.diag_photo = img
+                self.set_stage(self.STAGE_RUN)
+                self.toast(verdict[:60], OK if passed else WARN, ms=4000)
+                return
+            self.toast(verdict, WARN, ms=2500)
         if h.get("regs_seq", 0) != self._tune_pop_seq:
             self._tune_pop_seq = h.get("regs_seq", 0)
             d, _ = self.link.get_regs()
@@ -2409,7 +2510,9 @@ class App:
             self.tune["cm"] = "0" if defaults[0x24] == 0xa6 else "2"
             self._tune_write(0x24, defaults[0x24])
             self._tune_send_cm()
-        self.toast("SENSOR RESET TO DRIVER DEFAULTS", OK, ms=1600)
+        self.pi_gains, self.pi_chan, self.pi_matrix = [1.0, 1.0, 1.0], [0, 1, 2], None
+        self.save_cfg()
+        self.toast("SENSOR + PI CORRECTION RESET TO DEFAULTS", OK, ms=1600)
 
     def _tune_apply_saved(self):
         saved = self.tune_saved or {}
@@ -2472,6 +2575,11 @@ class App:
         """Fixed per-channel gains + channel map found by the wizard (BGR)."""
         if self.pi_chan != [0, 1, 2]:
             img = img[:, :, self.pi_chan]
+        if self.pi_matrix:
+            M = np.array(self.pi_matrix, np.float32)          # 4x3: rows B,G,R,offset
+            flat = img.reshape(-1, 3).astype(np.float32)
+            out = flat @ M[:3] + M[3]
+            return np.clip(out, 0, 255).astype(np.uint8).reshape(img.shape)
         if any(abs(g - 1.0) > 0.01 for g in self.pi_gains):
             img = np.clip(img.astype(np.float32) * np.array(self.pi_gains, np.float32),
                           0, 255).astype(np.uint8)
@@ -2516,6 +2624,10 @@ class App:
         if colour is not None and name != "GREEN":
             self.button(bx, y0 + ph - 8, "AUTO", "#00695c", self.cal_auto, bs,
                         store=z, anchor="sw")
+            bx += self.text_w("AUTO", bs, True) + 44
+        if name == "AIM":
+            self.button(bx, y0 + ph - 8, "RUN ALL \u25b6", "#6a1b9a", self.cal_run_all, bs,
+                        store=z, anchor="sw")
         if name == "DONE":
             self.button(x0 + pw - 10, y0 + ph - 8, "SAVE  \u2713", "#2e7d32",
                         self.cal_save, bs, store=z, anchor="se")
@@ -2529,9 +2641,36 @@ class App:
         if self.cal_step == 1:                     # neutral step: AWB must not fight us
             self._tune_clear_auto(0x02, "WHITE BAL")
 
+    def cal_run_all(self):
+        """Whole sequence unattended: the operator only keeps the probe on the
+        screen. Each step gets AUTO rounds, then advances; SAVE at the end."""
+        self._cal_all = True
+        self.cal_step = 1
+        self.set_stage(self.STAGE_CAL)
+        self._cal_all_tick()
+
+    def _cal_all_tick(self):
+        if not self._cal_all or self.stage != self.STAGE_CAL:
+            self._cal_all = False
+            return
+        name = self.CAL_STEPS[self.cal_step][0]
+        if name == "DONE":
+            self._cal_all = False
+            self.cal_save()
+            return
+        rounds = 8 if name == "WHITE" else (4 if name != "GREEN" else 0)
+        if rounds:
+            self.root.after(900, lambda: self.cal_auto(rounds))
+        wait = 900 + rounds * 700 + 900
+        def advance():
+            if self._cal_all and self.stage == self.STAGE_CAL:
+                self.cal_next()
+                self._cal_all_tick()
+        self.root.after(wait, advance)
+
     def cal_next(self):
         name = self.CAL_STEPS[self.cal_step][0]
-        if name in ("RED", "GREEN", "BLUE") and self.cal_meas is not None:
+        if name in ("WHITE", "RED", "GREEN", "BLUE", "BLACK") and self.cal_meas is not None:
             self.cal_perm[name] = self.cal_meas[0]          # raw B,G,R means
         if self.cal_step < len(self.CAL_STEPS) - 1:
             self.cal_step += 1
@@ -2589,6 +2728,22 @@ class App:
         done = False
         if name == "WHITE":
             b, g, r = raw
+            mx = max(b, g, r)
+            # Exposure before white balance: a clipped channel cannot be
+            # balanced by any gain. Land the brightest channel near 200.
+            if mx > 235 or mx < 150:
+                self._tune_clear_auto(0x01, "EXPOSURE")
+                self._tune_clear_auto(0x04, "GAIN")
+                exp = (self._reg(0x03, 1) << 8) | self._reg(0x04, 0xe8)
+                factor = max(0.5, min(1.6, 200.0 / max(mx, 1.0)))
+                exp = int(max(4, min(4095, exp * factor)))
+                self.tune["regs"][0x03] = exp >> 8
+                self._tune_write(0x03, exp >> 8)
+                self._tune_write(0x04, exp & 0xff)
+                self.save_cfg()
+                if rounds > 1:
+                    self.root.after(700, lambda: self.cal_auto(rounds - 1))
+                return
             if min(b, g, r) < 8:
                 self.toast("TOO DARK TO BALANCE \u2014 more light or closer", WARN)
                 return
@@ -2646,7 +2801,23 @@ class App:
         return perm
 
     def cal_save(self):
-        if len(self.cal_perm) == 3:
+        # Colour correction matrix from the measured patches (least squares,
+        # camera raw -> displayed colour, with offset). This is the standard
+        # camera-profile approach and does not depend on any sensor register
+        # behaving; it needs unclipped, well-exposed measurements.
+        targets = {"WHITE": (235, 235, 235), "RED": (0, 0, 235), "GREEN": (0, 235, 0),
+                   "BLUE": (235, 0, 0), "BLACK": (8, 8, 8)}
+        have = [k for k in targets if k in self.cal_perm]
+        if len(have) >= 4:
+            X = np.array([list(self.cal_perm[k]) + [1.0] for k in have], np.float64)
+            T = np.array([targets[k] for k in have], np.float64)
+            M, _, rank, _ = np.linalg.lstsq(X, T, rcond=None)
+            if rank == 4 and np.all(np.abs(M[:3]) < 6.0) and np.all(np.abs(M[3]) < 200):
+                self.pi_matrix = [[float(v) for v in row] for row in M]
+                self.pi_gains = [1.0, 1.0, 1.0]
+                self.toast("COLOUR MATRIX FITTED FROM {} PATCHES \u2713".format(len(have)),
+                           OK, ms=1800)
+        if all(k in self.cal_perm for k in ("RED", "GREEN", "BLUE")):
             perm = self._cal_channel_check()
             if sorted(perm) == [0, 1, 2]:
                 self.pi_chan = perm
@@ -2664,6 +2835,7 @@ class App:
             pass
         self.cal_step = 0
         self.cal_perm = {}
+        self._cal_all = False
         self.set_stage(self.STAGE_RUN)
         self.toast("CALIBRATION SAVED \u2713", OK, ms=1800)
 
