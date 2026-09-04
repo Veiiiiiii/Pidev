@@ -114,7 +114,9 @@ APP_VER = "3.3"
 
 TYPE_IMU = 1
 TYPE_FRAME = 2
-TYPE_RAW = 3        # one uncompressed RGB565 frame, for the DIAG grid
+TYPE_RAW = 3        # uncompressed RGB565: DIAG one-shot, or the raw stream
+RAW_STREAM_W = 160  # the probe halves the frame for the raw stream
+RAW_STREAM_H = 120
 
 # Corrupted-length guard, per packet type. A corrupted length below the cap
 # makes the parser sit waiting for bytes that never come, so the caps are as
@@ -516,6 +518,8 @@ class ProbeLink:
         self.fw = ""                    # last firmware status string
         self.fw_ver = None              # (major, rev) from the ready line
         self.colour_mode = None         # probe's current colour mode, if told
+        self.raw_swap = False           # byte order for the raw stream
+        self.raw_stream = False         # probe is sending unconverted bytes
         self.calib_ok = None            # gyro calibration verdict, if told
         self.raw = None                 # last raw frame for the DIAG grid
         self.raw_seq = 0
@@ -655,9 +659,28 @@ class ProbeLink:
                     self.imu_time = time.monotonic()
 
         elif ptype == TYPE_RAW:
-            with self.lock:
-                self.raw = bytes(payload)
-                self.raw_seq += 1
+            payload = bytes(payload)
+            small = len(payload) == RAW_STREAM_W * RAW_STREAM_H * 2
+            if small:
+                # Raw stream: hand the bytes to OpenCV's own RGB565 decoder.
+                # No firmware conversion was involved, so nothing upstream can
+                # have misread them; if this looks wrong the sensor data is
+                # wrong, which is a different fault entirely.
+                buf = np.frombuffer(payload, dtype=np.uint8).reshape(
+                    RAW_STREAM_H, RAW_STREAM_W, 2)
+                if self.raw_swap:
+                    buf = buf[:, :, ::-1].copy()
+                img = cv2.cvtColor(buf, cv2.COLOR_BGR5652BGR)
+                now = time.monotonic()
+                with self.lock:
+                    self.frame = img
+                    self.frame_seq += 1
+                    self.last_frame_at = now
+                self._fps.append(now)
+            else:
+                with self.lock:
+                    self.raw = payload
+                    self.raw_seq += 1
 
         elif ptype == TYPE_FRAME:
             arr = np.frombuffer(payload, dtype=np.uint8)
@@ -714,6 +737,8 @@ class ProbeLink:
                                         else None)
                     cal = data.get("calib")
                     self.calib_ok = (bool(cal) if cal is not None else None)
+            elif st == "raw_stream":
+                self.raw_stream = bool(data.get("on"))
             elif st == "colour_mode":
                 try:
                     self.colour_mode = int(data.get("mode", 0))
@@ -739,6 +764,7 @@ class ProbeLink:
                 "fw": self.fw,
                 "fw_ver": self.fw_ver,
                 "colour_mode": self.colour_mode,
+                "raw_stream": self.raw_stream,
                 "calib_ok": self.calib_ok,
                 "raw_seq": self.raw_seq,
                 "calibrating": self.calibrating,
@@ -1505,6 +1531,27 @@ class App:
                                       state="hidden")
         self.hud.append(self.nosignal)
 
+    def toggle_raw_stream(self):
+        """
+        Ask the probe to stop encoding and just send its bytes.
+
+        This is the deciding test for the colour argument. In this mode no
+        firmware code touches a pixel: the sensor's RGB565 travels untouched
+        and OpenCV's own cvtColor turns it into a picture here. If it looks
+        right, the fault was always in the firmware's conversion. If it still
+        looks wrong, pixel interpretation was never the problem and the search
+        moves to the parallel bus.
+
+        Costs resolution -- 160x120, since raw is four times the size of the
+        JPEG and the IMU shares the link -- which is a fair price for an
+        answer.
+        """
+        if not self.link.send_byte(ord("s")):
+            self.toast("PROBE NOT CONNECTED", WARN)
+            return
+        self.toast("RAW STREAM toggled \u2014 no firmware colour conversion",
+                   OK, ms=2600)
+
     def cycle_colour(self):
         """
         Ask the probe for its next colour mode (0 raw / 1 byte-swap / 2 YUV).
@@ -1514,12 +1561,12 @@ class App:
         once per guess. The probe acknowledges with a status packet, which
         pops the COLOUR MODE toast below.
         """
+        # No version gate. fw_ver is only learned from the boot status line,
+        # so a Pi that attached after the probe had already booted never sees
+        # it and would refuse a perfectly capable probe -- which is exactly
+        # what happened in the field. Send the byte; an old probe simply
+        # ignores it.
         h = self.link.health()
-        fv = h.get("fw_ver")
-        if fv is None or fv < (3, 2) or h.get("colour_mode") is None:
-            self.toast("PROBE FIRMWARE HAS NO COLOUR SWITCH \u2014 FLASH v3.2",
-                       WARN, ms=2600)
-            return
         if not self.link.send_byte(ord("c")):
             self.toast("PROBE NOT CONNECTED", WARN)
 
@@ -1534,11 +1581,6 @@ class App:
             self.diag_photo = None
             return
         h = self.link.health()
-        fv = h.get("fw_ver")
-        if fv is None or fv < (3, 3):
-            self.toast("PROBE FIRMWARE HAS NO DIAG \u2014 FLASH v3.3",
-                       WARN, ms=2600)
-            return
         if self.link.send_byte(ord("r")):
             self.toast("DIAG: requesting raw frame \u2026", DIM, ms=1200)
         else:
@@ -1582,6 +1624,13 @@ class App:
             self.flip_axis()
         elif k == "d" and self.stage == self.STAGE_RUN:
             self.toggle_diag()
+        elif k == "r" and self.stage == self.STAGE_RUN:
+            self.toggle_raw_stream()
+        elif k == "x" and self.stage == self.STAGE_RUN:
+            self.link.raw_swap = not self.link.raw_swap
+            self.toast("RAW BYTE ORDER: "
+                       + ("SWAPPED" if self.link.raw_swap else "NORMAL"),
+                       OK, ms=1400)
         elif k == "b" and self.stage == self.STAGE_RUN:
             self.swap_rb = not self.swap_rb
             self._awb_gains = None
@@ -1800,6 +1849,8 @@ class App:
                 bits.append("ROT180")
             if self.awb:
                 bits.append("AWB")
+            if h.get("raw_stream"):
+                bits.append("RAW" + ("~" if self.link.raw_swap else ""))
             if self.diag_photo is not None:
                 bits.append("DIAG")
             if h["state"] != "online":
