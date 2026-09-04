@@ -675,8 +675,8 @@ class ProbeLink:
                 with self.lock:
                     self.frame = img
                     self.frame_seq += 1
-                    self.last_frame_at = now
-                self._fps.append(now)
+                    self.frame_time = now       # what frame_age reads
+                    self._fps.append(now)
             else:
                 with self.lock:
                     self.raw = payload
