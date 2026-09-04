@@ -733,6 +733,14 @@ class ProbeLink:
         self.camera = None              # optional UVC source, overrides video
         self.test_pattern = False       # probe is sending synthetic bars
         self.calib_ok = None            # gyro calibration verdict, if told
+        # The firmware also reports the gyro spread it measured. That single
+        # number separates three unrelated faults that previously all printed
+        # the same "keep it still" advice:
+        #   spread < 0        the sensor never answered  -> IMU bus fault
+        #   3 .. ~50 deg/s    it really was moving       -> hold it still
+        #   ~150 deg/s        BMI270 post-config garbage -> power-cycle
+        self.calib_spread = None        # deg/s span seen during calibration
+        self.calib_attempt = None       # which of the 3 tries reported last
         self.raw = None                 # last raw frame for the DIAG grid
         self.raw_seq = 0
         self.calibrating = False
@@ -968,6 +976,12 @@ class ProbeLink:
                 self.calibrating = True
             elif st in ("calibrated", "calib_moved", "ready"):
                 self.calibrating = False
+                sp = data.get("spread")
+                if isinstance(sp, (int, float)):
+                    self.calib_spread = float(sp)
+                at = data.get("attempt")
+                if isinstance(at, (int, float)):
+                    self.calib_attempt = int(at)
                 if st == "ready":
                     try:
                         v = data.get("v")
@@ -1065,6 +1079,8 @@ class ProbeLink:
                 "raw_stream": self.raw_stream,
                 "test_pattern": self.test_pattern,
                 "calib_ok": self.calib_ok,
+                "calib_spread": self.calib_spread,
+                "calib_attempt": self.calib_attempt,
                 "raw_seq": self.raw_seq,
                 "calibrating": self.calibrating,
                 "camera_failed": self.camera_failed,
@@ -2643,8 +2659,24 @@ class App:
             s += " \u2014 probe moved during calibration; keep it still a moment"
             return s, WARN
         if h.get("calib_ok") is False:
-            return (s + " \u00b7 GYRO CALIB FAILED \u2014 reboot the probe "
-                    "and keep it still", WARN)
+            # Say WHICH failure this is. "Keep it still" is actively wrong
+            # when the sensor never answered, and it wastes the operator's
+            # time when the BMI270 threw post-configuration garbage. The
+            # firmware measured the number; use it.
+            sp = h.get("calib_spread")
+            if isinstance(sp, (int, float)) and sp < 0:
+                return (s + " \u00b7 GYRO NOT RESPONDING \u2014 IMU bus fault, "
+                        "not movement", WARN)
+            if isinstance(sp, (int, float)) and sp > 100:
+                return (s + " \u00b7 GYRO CALIB FAILED (spread %.0f\u00b0/s "
+                        "= sensor garbage, not you) \u2014 power-cycle the probe"
+                        % sp, WARN)
+            if isinstance(sp, (int, float)):
+                return (s + " \u00b7 GYRO CALIB FAILED (moved %.1f\u00b0/s, needs "
+                        "<3) \u2014 set it DOWN, cable slack, replug at the Pi "
+                        "end, wait 6 s" % sp, WARN)
+            return (s + " \u00b7 GYRO CALIB FAILED \u2014 set the probe down "
+                    "and power-cycle it", WARN)
         fv = h.get("fw_ver")
         if fv == (0, 0):
             # It answered "ready" without a version: pre-v3 firmware.
