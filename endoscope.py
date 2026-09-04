@@ -117,7 +117,7 @@ from PIL import Image, ImageTk
 CONFIG = os.path.join(os.path.expanduser("~"), ".config", "endoscope.json")
 SYNC = b"\xa5\x5a"
 APP_VER = "5.0"
-CONFIG_REV = 6
+CONFIG_REV = 5
 
 TYPE_IMU = 1
 TYPE_FRAME = 2
@@ -1921,10 +1921,12 @@ class App:
             # grey-world AWB and a 180-degree compensation. Replaying those
             # settings is enough to corrupt a now-correct official frame, so
             # migrate only the proven orientation choices.
-            # v5 and earlier had no independent flips. Orientation choices
-            # (which body axis the lens looks along, and the up/down polarity)
-            # are hard-won and must survive; everything colour-related is
-            # deliberately dropped, and the flips start off.
+            # NOTE: do NOT bump CONFIG_REV to add a key. New keys are read
+            # with .get(name, default), so an older config already works.
+            # Bumping the revision pushes a working config down this lossy
+            # migration branch, which silently discards the operator's colour
+            # calibration and TUNE registers. v6 did that by accident and it
+            # cost a bench session.
             return {"config_rev": CONFIG_REV,
                     "axis": int(cfg.get("axis", 0)),
                     "el_sign": float(cfg.get("el_sign", -1)),
