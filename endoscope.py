@@ -110,13 +110,17 @@ from PIL import Image, ImageTk
 
 CONFIG = os.path.join(os.path.expanduser("~"), ".config", "endoscope.json")
 SYNC = b"\xa5\x5a"
+APP_VER = "3.3"
+
 TYPE_IMU = 1
 TYPE_FRAME = 2
+TYPE_RAW = 3        # one uncompressed RGB565 frame, for the DIAG grid
 
 # Corrupted-length guard, per packet type. A corrupted length below the cap
 # makes the parser sit waiting for bytes that never come, so the caps are as
 # tight as the real traffic allows: IMU JSON is ~200 bytes, frames ~10-40 KB.
-MAX_LEN = {TYPE_IMU: 4 * 1024, TYPE_FRAME: 256 * 1024}
+MAX_LEN = {TYPE_IMU: 4 * 1024, TYPE_FRAME: 256 * 1024,
+           TYPE_RAW: 256 * 1024}
 
 # Which body axis the lens looks along. The probe can be mounted any way round,
 # so this is chosen once during setup and remembered.
@@ -313,6 +317,51 @@ class AxisDetector:
         return None
 
 
+# ---------------------------------------------------- colour diagnostics
+
+def build_diag_grid(raw, width, height):
+    """
+    Render one raw sensor frame under every plausible interpretation, side by
+    side with labels. The tile that looks like a photograph is the truth about
+    what the sensor streams; anything else is guesswork. If EVERY tile is
+    noise, the problem is not pixel interpretation at all but the parallel
+    data bus itself (pins / pixel clock), which is a different hunt.
+    """
+    if len(raw) < width * height * 2:
+        return None
+    buf = np.frombuffer(raw, dtype=np.uint8,
+                        count=width * height * 2).reshape(height, width, 2)
+
+    def rgb565(le):
+        w16 = (buf[:, :, 0].astype(np.uint16)
+               | (buf[:, :, 1].astype(np.uint16) << 8)) if le else               (buf[:, :, 1].astype(np.uint16)
+               | (buf[:, :, 0].astype(np.uint16) << 8))
+        r = ((w16 >> 11) & 0x1F).astype(np.uint8) << 3
+        g = ((w16 >> 5) & 0x3F).astype(np.uint8) << 2
+        b = (w16 & 0x1F).astype(np.uint8) << 3
+        return np.dstack([b, g, r])                       # BGR for cv2
+
+    tiles = [("RGB565 = COLOR mode 0", rgb565(False)),
+             ("swapped = COLOR mode 1", rgb565(True)),
+             ("YUYV = COLOR mode 2", cv2.cvtColor(buf, cv2.COLOR_YUV2BGR_YUY2)),
+             ("YUV YVYU", cv2.cvtColor(buf, cv2.COLOR_YUV2BGR_YVYU)),
+             ("YUV UYVY", cv2.cvtColor(buf, cv2.COLOR_YUV2BGR_UYVY))]
+
+    label_h = 26
+    th, tw = height + label_h, width
+    grid = np.full(((th) * 2, tw * 3, 3), 16, np.uint8)
+    for i, (name, img) in enumerate(tiles):
+        r, c = divmod(i, 3)
+        y, x = r * th, c * tw
+        grid[y + label_h:y + th, x:x + tw] = img
+        cv2.putText(grid, name, (x + 8, y + 19),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.55, (240, 245, 250), 1)
+    cv2.putText(grid, "DIAG - photograph this",
+                (tw * 2 + 8, th + 19),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.55, (140, 220, 160), 1)
+    return grid
+
+
 # ------------------------------------------------------------- serial link
 
 def find_port(preferred=None):
@@ -359,6 +408,9 @@ class ProbeLink:
         self.fw = ""                    # last firmware status string
         self.fw_ver = None              # (major, rev) from the ready line
         self.colour_mode = None         # probe's current colour mode, if told
+        self.calib_ok = None            # gyro calibration verdict, if told
+        self.raw = None                 # last raw frame for the DIAG grid
+        self.raw_seq = 0
         self.calibrating = False
         self.camera_failed = False
         self.generation = 0
@@ -494,6 +546,11 @@ class ProbeLink:
                     self.still = bool(data.get("st"))
                     self.imu_time = time.monotonic()
 
+        elif ptype == TYPE_RAW:
+            with self.lock:
+                self.raw = bytes(payload)
+                self.raw_seq += 1
+
         elif ptype == TYPE_FRAME:
             arr = np.frombuffer(payload, dtype=np.uint8)
             img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
@@ -547,6 +604,8 @@ class ProbeLink:
                     cm = data.get("cm")
                     self.colour_mode = (int(cm) if isinstance(cm, (int, float))
                                         else None)
+                    cal = data.get("calib")
+                    self.calib_ok = (bool(cal) if cal is not None else None)
             elif st == "colour_mode":
                 try:
                     self.colour_mode = int(data.get("mode", 0))
@@ -559,6 +618,10 @@ class ProbeLink:
         with self.lock:
             return self.frame, self.frame_seq, self.quat, self.still
 
+    def take_raw(self):
+        with self.lock:
+            return self.raw, self.raw_seq
+
     def health(self):
         now = time.monotonic()
         with self.lock:
@@ -568,6 +631,8 @@ class ProbeLink:
                 "fw": self.fw,
                 "fw_ver": self.fw_ver,
                 "colour_mode": self.colour_mode,
+                "calib_ok": self.calib_ok,
+                "raw_seq": self.raw_seq,
                 "calibrating": self.calibrating,
                 "camera_failed": self.camera_failed,
                 "generation": self.generation,
@@ -595,8 +660,11 @@ class SimLink:
         self.still = False
         self.state = "online"
         self.fw = "ready"
-        self.fw_ver = (3, 2)
+        self.fw_ver = (3, 3)
         self.colour_mode = 1
+        self.calib_ok = True
+        self.raw = None
+        self.raw_seq = 0
         self.calibrating = False
         self.camera_failed = False
         self.generation = 1
@@ -641,7 +709,22 @@ class SimLink:
         elif b in (ord("0"), ord("1"), ord("2")):
             with self.lock:
                 self.colour_mode = b - ord("0")
+        elif b in (ord("r"), ord("R")):
+            with self.lock:
+                f = self.frame
+            if f is not None:                    # BGR -> RGB565 little-endian
+                r = (f[:, :, 2] >> 3).astype(np.uint16)
+                g = (f[:, :, 1] >> 2).astype(np.uint16)
+                bl = (f[:, :, 0] >> 3).astype(np.uint16)
+                w16 = (r << 11) | (g << 5) | bl
+                with self.lock:
+                    self.raw = w16.astype("<u2").tobytes()
+                    self.raw_seq += 1
         return True
+
+    def take_raw(self):
+        with self.lock:
+            return self.raw, self.raw_seq
 
     def _loop(self):
         frame_due = 0.0
@@ -675,6 +758,7 @@ class SimLink:
         with self.lock:
             return {"state": "online", "fw": self.fw, "calibrating": False,
                     "fw_ver": self.fw_ver, "colour_mode": self.colour_mode,
+                    "calib_ok": self.calib_ok, "raw_seq": self.raw_seq,
                     "camera_failed": False, "generation": self.generation,
                     "imu_age": now - self.imu_time if self.imu_time else 1e9,
                     "frame_age": now - self.frame_time if self.frame_time else 1e9,
@@ -846,6 +930,9 @@ class App:
         self.check_hint = None          # CHECK's first guidance line
         self._hint_state = ""           # wait / armed / locked
         self._last_cm = None            # last colour mode we toasted about
+        self.rot180 = bool(self.cfg.get("rot180", True))
+        self.diag_photo = None          # sticky DIAG grid, shown over video
+        self._raw_seen = 0
         self.stage = self.STAGE_SETUP
         self.last_seq = -1
         self.photo = None
@@ -907,7 +994,8 @@ class App:
         try:
             os.makedirs(os.path.dirname(CONFIG), exist_ok=True)
             with open(CONFIG, "w", encoding="utf-8") as f:
-                json.dump({"axis": self.axis_idx}, f)
+                json.dump({"axis": self.axis_idx,
+                           "rot180": self.rot180}, f)
         except Exception:
             pass
 
@@ -1128,6 +1216,9 @@ class App:
             max(10, H // 46), H - max(10, H // 46), anchor="sw",
             text="PROBE: \u2026", fill=DIM, font=self.f(small))
         z.append(self.setup_status)
+        z.append(c.create_text(W - max(10, H // 46), H - max(10, H // 46),
+                               anchor="se", text="app v" + APP_VER,
+                               fill=MUTED, font=self.f(small)))
 
     def do_zero(self):
         if not self.capture_zero():
@@ -1185,8 +1276,8 @@ class App:
         y += tiny * 2 + H * 0.006
         z.append(c.create_text(
             W / 2, y,
-            text="Then turn right \u2014 the arrow must swing right.   "
-                 "Wrong? Press RE-ZERO and redo the move.",
+            text="Then turn right \u2014 arrow must swing right.   "
+                 "Up/down reversed? Press FLIP U/D.",
             fill=MUTED, font=self.f(tiny)))
 
         if abs(ref_elevation(self.q_ref, self.axis_idx)) > math.radians(60):
@@ -1200,6 +1291,7 @@ class App:
         bs = max(13, int(H / 27))
         gap = max(14, int(W / 60))
         labels = [("AXIS " + AXES[self.axis_idx][0], "#455a64", self.cycle_axis),
+                  ("FLIP U/D", "#6d4c41", self.flip_axis),
                   ("RE-ZERO", "#1565c0", self.do_zero),
                   ("START", "#2e7d32", self.start_run)]
         widths = [self.text_w(t, bs, True) + 52 for t, _, _ in labels]
@@ -1212,6 +1304,25 @@ class App:
             if cb == self.cycle_axis:
                 self.axis_btn_text = t
             x += w + gap
+
+    def flip_axis(self):
+        """
+        Swap the lens axis for its antipode. Up/down reading exactly inverted
+        while left/right stays correct means precisely this: the selected axis
+        is the BACKWARD one (a tilt-down slipped into the detection gesture,
+        or an old inverted lock is still saved in the config). One tap fixes
+        the saved state; no re-zero needed, the reference pose is still valid.
+        AXES is ordered in antipodal pairs, so the partner is index XOR 1.
+        """
+        self.axis_auto = False
+        self.axis_idx ^= 1
+        self.save_cfg()
+        self.peak_az = 0.0
+        if self.axis_btn_text:
+            self.canvas.itemconfigure(self.axis_btn_text,
+                                      text="AXIS " + AXES[self.axis_idx][0])
+        self.toast("AXIS FLIPPED: " + AXES[self.axis_idx][0] + " \u2713",
+                   OK, ms=2000)
 
     def cycle_axis(self):
         # A manual choice wins over the detector until the next ZERO/RE-ZERO,
@@ -1239,6 +1350,9 @@ class App:
                     bs, store=self.hud, anchor="se")
         self.button(pad, H - pad - int(H * 0.055), "COLOR", "#455a64",
                     self.cycle_colour, max(10, int(H / 38)),
+                    store=self.hud, anchor="sw")
+        self.button(pad, H - pad - int(H * 0.055) - int(H * 0.085), "DIAG",
+                    "#4e5d3a", self.toggle_diag, max(10, int(H / 38)),
                     store=self.hud, anchor="sw")
 
         panel = int(min(W, H) * 0.33)
@@ -1283,6 +1397,27 @@ class App:
         if not self.link.send_byte(ord("c")):
             self.toast("PROBE NOT CONNECTED", WARN)
 
+    def toggle_diag(self):
+        """
+        Ask the probe for one RAW frame and freeze an interpretation grid on
+        screen (photograph it); press again to go back to live video. This
+        exists because cycling three colour modes blind can still leave "all
+        wrong", and the grid settles in one shot what the sensor really sends.
+        """
+        if self.diag_photo is not None:
+            self.diag_photo = None
+            return
+        h = self.link.health()
+        fv = h.get("fw_ver")
+        if fv is None or fv < (3, 3):
+            self.toast("PROBE FIRMWARE HAS NO DIAG \u2014 FLASH v3.3",
+                       WARN, ms=2600)
+            return
+        if self.link.send_byte(ord("r")):
+            self.toast("DIAG: requesting raw frame \u2026", DIM, ms=1200)
+        else:
+            self.toast("PROBE NOT CONNECTED", WARN)
+
     def zero_inplace(self):
         """
         Re-zero without leaving the video. Heading drifts; the fix is one tap:
@@ -1308,6 +1443,16 @@ class App:
             self.start_run()
         elif k == "c" and self.stage == self.STAGE_RUN:
             self.cycle_colour()
+        elif k == "f" and self.stage == self.STAGE_CHECK:
+            self.flip_axis()
+        elif k == "d" and self.stage == self.STAGE_RUN:
+            self.toggle_diag()
+        elif k == "v" and self.stage == self.STAGE_RUN:
+            self.rot180 = not self.rot180
+            self.save_cfg()
+            self.last_seq = -1          # redraw the current frame flipped
+            self.toast("ROTATE 180: " + ("ON" if self.rot180 else "OFF"),
+                       OK, ms=1200)
 
     # ---- per-frame update
 
@@ -1330,6 +1475,9 @@ class App:
         if h["fw"] == "calib_moved":
             s += " \u2014 probe moved during calibration; keep it still a moment"
             return s, WARN
+        if h.get("calib_ok") is False:
+            return (s + " \u00b7 GYRO CALIB FAILED \u2014 reboot the probe "
+                    "and keep it still", WARN)
         fv = h.get("fw_ver")
         if fv == (0, 0):
             # It answered "ready" without a version: pre-v3 firmware.
@@ -1428,11 +1576,27 @@ class App:
                     names = {0: "RAW", 1: "BYTE-SWAP", 2: "YUV"}
                     self.toast("COLOUR MODE {} \u2014 {}".format(
                         cm, names.get(cm, "?")), OK, ms=1600)
-            if frame is not None and seq != self.last_seq:
+            if h.get("raw_seq", 0) != self._raw_seen:
+                raw, self._raw_seen = self.link.take_raw()
+                grid = build_diag_grid(raw, 320, 240) if raw else None
+                if grid is not None:
+                    self.diag_photo = grid
+                    self.toast("DIAG grid \u2014 photograph the screen, "
+                               "press DIAG to leave", OK, ms=3000)
+
+            show = self.diag_photo if self.diag_photo is not None else frame
+            fresh = (self.diag_photo is not None) or (frame is not None
+                                                      and seq != self.last_seq)
+            if show is not None and fresh:
                 self.last_seq = seq
-                fh, fw = frame.shape[:2]
+                if self.diag_photo is None and self.rot180:
+                    # The camera module sits upside-down in the case, so the
+                    # picture is delivered rotated; flip it for the operator.
+                    # DIAG stays unrotated: it must show the sensor's truth.
+                    show = cv2.rotate(show, cv2.ROTATE_180)
+                fh, fw = show.shape[:2]
                 scale = min(self.W / fw, self.H / fh)
-                small = cv2.resize(frame, (int(fw * scale), int(fh * scale)),
+                small = cv2.resize(show, (int(fw * scale), int(fh * scale)),
                                    interpolation=cv2.INTER_LINEAR)
                 rgb = cv2.cvtColor(small, cv2.COLOR_BGR2RGB)
                 self.photo = ImageTk.PhotoImage(Image.fromarray(rgb))
@@ -1441,7 +1605,7 @@ class App:
                 for i in self.hud:
                     self.canvas.tag_raise(i)
 
-            stale = h["frame_age"] > 2.5
+            stale = h["frame_age"] > 2.5 and self.diag_photo is None
             self.canvas.itemconfigure(
                 self.nosignal,
                 state="normal" if stale else "hidden",
@@ -1457,6 +1621,10 @@ class App:
                 text="AZ {:+.0f}\u00b0   EL {:+.0f}\u00b0".format(
                     math.degrees(az), math.degrees(el)))
             bits = ["{:.0f} fps".format(h["fps"])]
+            if self.rot180:
+                bits.append("ROT180")
+            if self.diag_photo is not None:
+                bits.append("DIAG")
             if h["state"] != "online":
                 bits.append(h["state"].upper())
             if still:
