@@ -1256,6 +1256,19 @@ class App:
         cal = self.cfg.get("cal") or {}
         self.pi_gains = [float(x) for x in cal.get("gains", [1.0, 1.0, 1.0])]  # B,G,R
         self.pi_chan = [int(x) for x in cal.get("chan", [0, 1, 2])]            # BGR index map
+        # Black point, white point and gamma, per channel. Gains alone cannot
+        # fix this sensor: measured on a real frame, blue sits only 22 below
+        # the others at the 99th percentile but 100 below at the median. A
+        # gain is a straight multiply, so lifting blue's midtones by the 3x
+        # they need drives its highlights past 255 and the whites burn out --
+        # which is exactly what "no black and no white" looks like. Anchoring
+        # black, white and mid separately is the only thing that fixes a
+        # transfer curve rather than a level.
+        self.pi_black = [float(x) for x in cal.get("black", [0.0, 0.0, 0.0])]
+        self.pi_white = [float(x) for x in cal.get("white", [255.0, 255.0, 255.0])]
+        self.pi_gamma = [float(x) for x in cal.get("gamma", [1.0, 1.0, 1.0])]
+        self._lut = None
+        self.cal_group = 0
         self.pi_bright = float(cal.get("bright", 0.0))    # -80 .. +80, added
         self.pi_sat = float(cal.get("sat", 1.0))          # 0 .. 2, multiplies
         self.pi_matrix = cal.get("matrix")           # 4x3 colour correction, or None
@@ -1357,6 +1370,9 @@ class App:
                            "tune": self.tune_saved,
                            "cal": {"gains": self.pi_gains, "chan": self.pi_chan,
                                    "bright": self.pi_bright, "sat": self.pi_sat,
+                                   "black": self.pi_black,
+                                   "white": self.pi_white,
+                                   "gamma": self.pi_gamma,
                                    "matrix": self.pi_matrix}}, f)
         except Exception:
             pass
@@ -2562,142 +2578,204 @@ class App:
     # measurement is shown as numbers, so nothing here relies on eyeballing.
 
 
+    def _build_lut(self):
+        """
+        One 256-entry curve per channel: subtract black, scale to white, then
+        gamma. Precomputed because doing this per pixel on a Pi would cost
+        more than the video decode.
+        """
+        lut = np.zeros((256, 3), np.uint8)
+        x = np.arange(256, dtype=np.float32)
+        for ch in range(3):
+            lo = float(self.pi_black[ch])
+            hi = float(self.pi_white[ch])
+            if hi - lo < 8.0:                      # nonsense capture: bypass
+                lo, hi = 0.0, 255.0
+            n = np.clip((x - lo) / (hi - lo), 0.0, 1.0)
+            g = max(0.2, min(5.0, float(self.pi_gamma[ch])))
+            if abs(g - 1.0) > 0.01:
+                n = np.power(n, 1.0 / g)
+            n = n * 255.0 * float(self.pi_gains[ch])
+            lut[:, ch] = np.clip(n, 0, 255).astype(np.uint8)
+        self._lut = lut
+        return lut
+
+    def _levels_active(self):
+        return (any(b > 0.5 for b in self.pi_black)
+                or any(w < 254.5 for w in self.pi_white)
+                or any(abs(g - 1.0) > 0.01 for g in self.pi_gamma)
+                or any(abs(g - 1.0) > 0.01 for g in self.pi_gains))
+
     def _pi_colour(self, img):
         """
-        Channel map, per-channel gain, brightness, saturation. In that order,
-        because white balance has to happen before saturation or a cast gets
-        amplified along with the colour you wanted.
+        Channel map, then levels + gamma + gain through a LUT, then brightness
+        and saturation. White balance has to land before saturation or a cast
+        gets amplified along with the colour you wanted.
         """
         if self.pi_chan != [0, 1, 2]:
             img = img[:, :, self.pi_chan]
         if self.pi_matrix:
-            M = np.array(self.pi_matrix, np.float32)          # 4x3: rows B,G,R,offset
+            M = np.array(self.pi_matrix, np.float32)          # 4x3: B,G,R,offset
             flat = img.reshape(-1, 3).astype(np.float32)
             img = np.clip(flat @ M[:3] + M[3], 0, 255).astype(np.uint8).reshape(img.shape)
 
-        need_gain = any(abs(g - 1.0) > 0.01 for g in self.pi_gains)
+        if self._levels_active():
+            lut = self._lut if self._lut is not None else self._build_lut()
+            out = np.empty_like(img)
+            for ch in range(3):
+                out[:, :, ch] = lut[:, ch][img[:, :, ch]]
+            img = out
+
         need_bri = abs(self.pi_bright) > 0.5
         need_sat = abs(self.pi_sat - 1.0) > 0.01
-        if not (need_gain or need_bri or need_sat):
+        if not (need_bri or need_sat):
             return img
-
-        out = img.astype(np.float32)
-        if need_gain:
-            out *= np.array(self.pi_gains, np.float32)
+        o = img.astype(np.float32)
         if need_bri:
-            out += self.pi_bright
+            o += self.pi_bright
         if need_sat:
-            grey = out.mean(axis=2, keepdims=True)
-            out = grey + (out - grey) * self.pi_sat
-        return np.clip(out, 0, 255).astype(np.uint8)
+            grey = o.mean(axis=2, keepdims=True)
+            o = grey + (o - grey) * self.pi_sat
+        return np.clip(o, 0, 255).astype(np.uint8)
 
     # ---- colour panel: manual control, plus one reliable automatic ---------
 
-    COLOUR_ROWS = [
-        ("RED",        "gain", 2, 0.05, 0.25, 4.0),
-        ("GREEN",      "gain", 1, 0.05, 0.25, 4.0),
-        ("BLUE",       "gain", 0, 0.05, 0.25, 4.0),
-        ("BRIGHTNESS", "bri",  0, 4.0,  -80.0, 80.0),
-        ("SATURATION", "sat",  0, 0.05, 0.0,  2.0),
+    # Rows are grouped: only one group is on screen at a time, so five large
+    # touch targets never have to share the space with fifteen.
+    COLOUR_GROUPS = [
+        ("LEVELS", [("BLACK R", "black", 2, 2.0, 0.0, 200.0),
+                    ("BLACK G", "black", 1, 2.0, 0.0, 200.0),
+                    ("BLACK B", "black", 0, 2.0, 0.0, 200.0)]),
+        ("WHITE",  [("WHITE R", "white", 2, 2.0, 40.0, 255.0),
+                    ("WHITE G", "white", 1, 2.0, 40.0, 255.0),
+                    ("WHITE B", "white", 0, 2.0, 40.0, 255.0)]),
+        ("GAMMA",  [("GAMMA R", "gamma", 2, 0.05, 0.2, 5.0),
+                    ("GAMMA G", "gamma", 1, 0.05, 0.2, 5.0),
+                    ("GAMMA B", "gamma", 0, 0.05, 0.2, 5.0)]),
+        ("IMAGE",  [("RED GAIN", "gain", 2, 0.05, 0.25, 4.0),
+                    ("GREEN GAIN", "gain", 1, 0.05, 0.25, 4.0),
+                    ("BLUE GAIN", "gain", 0, 0.05, 0.25, 4.0),
+                    ("BRIGHTNESS", "bri", 0, 4.0, -80.0, 80.0),
+                    ("SATURATION", "sat", 0, 0.05, 0.0, 2.0)]),
     ]
 
     def _colour_value(self, kind, idx):
-        if kind == "gain":
-            return self.pi_gains[idx]
-        return self.pi_bright if kind == "bri" else self.pi_sat
+        return {"gain": self.pi_gains, "black": self.pi_black,
+                "white": self.pi_white, "gamma": self.pi_gamma}.get(
+            kind, [self.pi_bright if kind == "bri" else self.pi_sat])[
+            idx if kind in ("gain", "black", "white", "gamma") else 0]
 
     def _colour_set(self, kind, idx, val, lo, hi):
         val = max(lo, min(hi, val))
         if kind == "gain":
             self.pi_gains[idx] = round(val, 3)
+        elif kind == "black":
+            self.pi_black[idx] = round(val, 1)
+        elif kind == "white":
+            self.pi_white[idx] = round(val, 1)
+        elif kind == "gamma":
+            self.pi_gamma[idx] = round(val, 3)
         elif kind == "bri":
             self.pi_bright = round(val, 1)
         else:
             self.pi_sat = round(val, 3)
+        self._lut = None                       # curve changed, rebuild it
         self.last_seq = -1                     # force the preview to redraw
         self._refresh_colour_readouts()
 
     def enter_cal(self):
         """
-        Manual colour control with a live preview, and one automatic that is
-        actually dependable.
+        Anchor black, white and mid, then fine-tune by hand.
 
-        The previous wizard asked the operator to aim the probe at coloured
-        patches on this screen. Too much rides on things it cannot see: aim,
-        screen brightness, viewing angle, reflections. One bad patch poisons
-        the whole matrix, which is why every automatic result came out wrong.
+        The old wizard asked the operator to aim at coloured patches on this
+        screen and inferred a matrix. Too much rode on things it could not
+        see -- aim, screen brightness, viewing angle, reflections -- and one
+        bad patch poisoned the result, which is why every automatic answer
+        came out wrong.
 
-        A grey card needs none of that. Point at anything neutral -- paper, a
-        white wall -- and the three gains that make it neutral are arithmetic,
-        not inference. Everything else here is a direct control the operator
-        can see the effect of while pressing it.
+        These three captures ask for something unambiguous instead: cover the
+        lens, show white paper, show grey. Each fixes one end of the transfer
+        curve by arithmetic. Anchoring only white, as a gain does, cannot fix
+        this sensor, whose blue is close at the highlights and a third of the
+        others in the midtones.
         """
         c, W, H, z = self.canvas, self.W, self.H, self.stage_items
         z.append(c.create_rectangle(0, 0, W, H, fill="#0b1114", outline=""))
 
-        pad = max(10, int(H / 40))
-        title = max(14, int(H / 24))
-        row_f = max(11, int(H / 32))
-        small = max(9, int(H / 46))
+        pad = max(10, int(H / 44))
+        title = max(13, int(H / 26))
+        row_f = max(10, int(H / 34))
+        small = max(9, int(H / 48))
 
         z.append(c.create_text(pad, pad, anchor="nw", text="COLOUR",
                                fill="#ffffff", font=self.f(title, True)))
-        z.append(c.create_text(pad, pad + title * 1.9, anchor="nw",
-                               fill=DIM, font=self.f(small),
-                               text="point at something white or grey, then press GREY CARD"))
 
-        # Preview on the right, controls on the left: no overlap, nothing
-        # competing for the same pixels.
-        pv_w = int(W * 0.40)
+        pv_w = int(W * 0.38)
         pv_h = int(pv_w * 0.75)
         pv_x = W - pv_w - pad
-        pv_y = pad + int(title * 3.2)
+        pv_y = pad + int(title * 2.6)
         z.append(c.create_rectangle(pv_x - 2, pv_y - 2, pv_x + pv_w + 2,
                                     pv_y + pv_h + 2, outline=EDGE, width=2))
         self.cal_thumb = c.create_image(pv_x + pv_w / 2, pv_y + pv_h / 2)
         z.append(self.cal_thumb)
         self.cal_thumb_dims = (pv_w, pv_h)
 
-        # The square the grey card reads from, drawn so the operator can fill it.
-        rs = int(min(pv_w, pv_h) * 0.22)
+        rs = int(min(pv_w, pv_h) * 0.20)
         z.append(c.create_rectangle(pv_x + pv_w / 2 - rs, pv_y + pv_h / 2 - rs,
                                     pv_x + pv_w / 2 + rs, pv_y + pv_h / 2 + rs,
                                     outline="#9ccc65", width=2, dash=(5, 4)))
-        self.cal_text = c.create_text(pv_x + pv_w / 2, pv_y + pv_h + small * 2,
+        self.cal_text = c.create_text(pv_x + pv_w / 2, pv_y + pv_h + small * 1.8,
                                       fill="#9ccc65", font=self.f(small, True),
                                       text="")
         z.append(self.cal_text)
+        self.cal_hint = c.create_text(pv_x + pv_w / 2, pv_y + pv_h + small * 3.4,
+                                      fill=DIM, font=self.f(small),
+                                      text="fill the dashed square with the target")
+        z.append(self.cal_hint)
 
-        # One row per control, each a wide readout between two big buttons.
         col_w = pv_x - pad * 2
-        top = pv_y
-        row_h = int((H * 0.60) / len(self.COLOUR_ROWS))
-        btn = max(int(row_h * 0.62), 40)
+        btn = max(int(H * 0.085), 38)
+
+        # Group selector: one tap swaps which three controls are on screen.
+        gy = pv_y
+        gw = int((col_w - 3 * 6) / 4)
+        for i, (name, _) in enumerate(self.COLOUR_GROUPS):
+            sel = i == self.cal_group
+            self._pill(pad + i * (gw + 6), gy, int(btn * 0.8), name,
+                       "#00695c" if sel else "#2b3b44",
+                       lambda ix=i: self._set_group(ix), z, width=gw)
+
+        rows = self.COLOUR_GROUPS[self.cal_group][1]
+        top = gy + int(btn * 0.8) + pad
+        avail = (H - pad - btn - pad) - top
+        row_h = int(avail / max(len(rows), 1))
+        rb = min(btn, max(34, int(row_h * 0.72)))
         self.colour_readouts = {}
-        for i, (label, kind, idx, step, lo, hi) in enumerate(self.COLOUR_ROWS):
+        for i, (label, kind, idx, step, lo, hi) in enumerate(rows):
             y = top + i * row_h
-            z.append(c.create_text(pad, y, anchor="nw", text=label,
-                                   fill="#eceff1", font=self.f(row_f, True)))
-            by = y + row_f * 1.6
-            self._pill(pad, by, btn, "\u2212", "#37474f",
+            self._pill(pad, y, rb, "\u2212", "#37474f",
                        lambda k=kind, ix=idx, st=step, l=lo, h2=hi:
                        self._colour_set(k, ix, self._colour_value(k, ix) - st, l, h2), z)
-            self._pill(pad + col_w - btn, by, btn, "+", "#37474f",
+            self._pill(pad + col_w - rb, y, rb, "+", "#37474f",
                        lambda k=kind, ix=idx, st=step, l=lo, h2=hi:
                        self._colour_set(k, ix, self._colour_value(k, ix) + st, l, h2), z)
-            r = c.create_text(pad + col_w / 2, by + btn / 2, text="",
-                              fill="#80cbc4", font=self.f(row_f, True))
+            z.append(c.create_text(pad + rb + 10, y + rb / 2, anchor="w",
+                                   text=label, fill="#eceff1",
+                                   font=self.f(row_f, True)))
+            r = c.create_text(pad + col_w - rb - 10, y + rb / 2, anchor="e",
+                              text="", fill="#80cbc4", font=self.f(row_f, True))
             z.append(r)
             self.colour_readouts[label] = (r, kind, idx)
 
         by = H - pad - btn
-        bs = max(11, int(H / 40))
-        actions = [("GREY CARD", "#00695c", self.cal_grey_card),
-                   ("AUTO", "#455a64", self.cal_auto_wb),
+        bs = max(10, int(H / 44))
+        actions = [("BLACK", "#263238", self.cal_set_black),
+                   ("WHITE", "#546e7a", self.cal_set_white),
+                   ("GREY", "#00695c", self.cal_set_grey),
                    ("RESET", "#5d4037", self.cal_reset),
                    ("SAVE \u2713", "#2e7d32", self.cal_save)]
-        widths = [self.text_w(t, bs, True) + 40 for t, _, _ in actions]
-        gap = max(8, int((W - pad * 2 - sum(widths)) / (len(actions) - 1)))
+        widths = [self.text_w(t, bs, True) + 30 for t, _, _ in actions]
+        gap = max(6, int((W - pad * 2 - sum(widths)) / (len(actions) - 1)))
         x = pad
         for (label, col, cb), w in zip(actions, widths):
             self._pill(x, by, btn, label, col, cb, z, width=w)
@@ -2710,6 +2788,10 @@ class App:
         self.cal_meas = None
         self.last_seq = -1
         self._refresh_colour_readouts()
+
+    def _set_group(self, i):
+        self.cal_group = i
+        self.set_stage(self.STAGE_CAL)
 
     def _pill(self, x, y, h, label, fill, cb, store, width=None):
         w = width if width else h
@@ -2728,62 +2810,91 @@ class App:
             return
         for label, (item, kind, idx) in self.colour_readouts.items():
             v = self._colour_value(kind, idx)
-            txt = "{:+.0f}".format(v) if kind == "bri" else "{:.2f}".format(v)
+            if kind in ("black", "white"):
+                txt = "{:.0f}".format(v)
+            elif kind == "bri":
+                txt = "{:+.0f}".format(v)
+            else:
+                txt = "{:.2f}".format(v)
             try:
                 self.canvas.itemconfigure(item, text=txt)
             except Exception:
                 pass
 
-    def cal_grey_card(self):
-        """
-        Make the sampled square neutral. Three divisions, no inference.
-
-        This is how every camera has done white balance for decades, and it
-        works where the patch wizard did not because the operator supplies the
-        one thing the software cannot know: which part of the scene is
-        supposed to be colourless.
-        """
+    def _cal_patch(self, what):
+        """The mean B,G,R of the sampled square, before any correction."""
         if self.cal_meas is None:
             self.toast("NO PICTURE YET", WARN)
-            return
-        raw = self.cal_meas[0]                      # B,G,R means, uncorrected
-        if float(np.mean(raw)) < 12:
-            self.toast("TOO DARK \u2014 more light on the card", WARN, ms=2000)
-            return
-        if float(np.max(raw)) > 250:
-            self.toast("OVEREXPOSED \u2014 the card is clipping", WARN, ms=2000)
-            return
-        target = float(np.mean(raw))
-        self.pi_gains = [round(float(np.clip(target / max(v, 1e-3), 0.25, 4.0)), 3)
-                         for v in raw]
-        self.pi_matrix = None                       # a matrix would fight the gains
-        self.last_seq = -1
-        self._refresh_colour_readouts()
-        self.toast("WHITE BALANCE SET  R{:.2f} G{:.2f} B{:.2f}".format(
-            self.pi_gains[2], self.pi_gains[1], self.pi_gains[0]), OK, ms=2200)
+            return None
+        raw = self.cal_meas[0]
+        if what == "black" and float(np.max(raw)) > 90:
+            self.toast("NOT DARK ENOUGH \u2014 cover the lens", WARN, ms=2200)
+            return None
+        if what != "black" and float(np.mean(raw)) < 12:
+            self.toast("TOO DARK \u2014 more light on the card", WARN, ms=2200)
+            return None
+        if what == "white" and float(np.max(raw)) > 250:
+            self.toast("OVEREXPOSED \u2014 less light, or angle away", WARN, ms=2200)
+            return None
+        return raw
 
-    def cal_auto_wb(self):
-        """Grey-world over the whole frame: no card needed, less exact."""
-        if self.cal_meas is None:
-            self.toast("NO PICTURE YET", WARN)
+    def cal_set_black(self):
+        """Cover the lens. Whatever it still reads is the floor, per channel."""
+        raw = self._cal_patch("black")
+        if raw is None:
             return
-        frame, _, _, _ = self.link.snapshot()
-        if frame is None:
-            self.toast("NO PICTURE YET", WARN)
+        self.pi_black = [round(float(v), 1) for v in raw]
+        self._after_capture("BLACK POINT SET  R{:.0f} G{:.0f} B{:.0f}".format(
+            raw[2], raw[1], raw[0]))
+
+    def cal_set_white(self):
+        """Show white paper. That reading becomes 255 on every channel, which
+        balances the highlights and sets the top of the curve in one step."""
+        raw = self._cal_patch("white")
+        if raw is None:
             return
-        means = frame.reshape(-1, 3).mean(axis=0)
-        if float(np.mean(means)) < 8:
-            self.toast("TOO DARK", WARN)
+        self.pi_white = [round(max(float(v), self.pi_black[i] + 12.0), 1)
+                         for i, v in enumerate(raw)]
+        self._after_capture("WHITE POINT SET  R{:.0f} G{:.0f} B{:.0f}".format(
+            raw[2], raw[1], raw[0]))
+
+    def cal_set_grey(self):
+        """
+        Show mid grey. Black and white pin the ends; this pins the middle.
+
+        Without it a channel can match at both ends and still be wrong
+        everywhere between, which is this sensor's actual fault: blue is 22
+        low at the highlights and 100 low at the median.
+        """
+        raw = self._cal_patch("grey")
+        if raw is None:
             return
-        target = float(np.mean(means))
-        self.pi_gains = [round(float(np.clip(target / max(v, 1e-3), 0.25, 4.0)), 3)
-                         for v in means]
-        self.pi_matrix = None
+        gam = []
+        for ch in range(3):
+            lo, hi = self.pi_black[ch], self.pi_white[ch]
+            if hi - lo < 8:
+                gam.append(1.0)
+                continue
+            n = float(np.clip((raw[ch] - lo) / (hi - lo), 0.02, 0.98))
+            # Solve n**(1/g) = 0.5 so the grey card lands at half scale.
+            gam.append(round(float(np.clip(math.log(n) / math.log(0.5),
+                                           0.2, 5.0)), 3))
+        self.pi_gamma = gam
+        self._after_capture("MID SET  gamma R{:.2f} G{:.2f} B{:.2f}".format(
+            gam[2], gam[1], gam[0]))
+
+    def _after_capture(self, msg):
+        self.pi_matrix = None                  # a matrix would fight the curve
+        self._lut = None
         self.last_seq = -1
         self._refresh_colour_readouts()
-        self.toast("AUTO WHITE BALANCE APPLIED", OK, ms=1800)
+        self.toast(msg, OK, ms=2400)
 
     def cal_reset(self):
+        self.pi_black = [0.0, 0.0, 0.0]
+        self.pi_white = [255.0, 255.0, 255.0]
+        self.pi_gamma = [1.0, 1.0, 1.0]
+        self._lut = None
         self.pi_gains = [1.0, 1.0, 1.0]
         self.pi_chan = [0, 1, 2]
         self.pi_matrix = None
