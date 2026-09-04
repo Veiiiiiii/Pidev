@@ -110,7 +110,7 @@ from PIL import Image, ImageTk
 
 CONFIG = os.path.join(os.path.expanduser("~"), ".config", "endoscope.json")
 SYNC = b"\xa5\x5a"
-APP_VER = "3.3"
+APP_VER = "4.1"
 
 TYPE_IMU = 1
 TYPE_FRAME = 2
@@ -518,6 +518,7 @@ class ProbeLink:
         self.fw = ""                    # last firmware status string
         self.fw_ver = None              # (major, rev) from the ready line
         self.colour_mode = None         # probe's current colour mode, if told
+        self.sensor_preset = None       # (n, name) from the probe, if told
         # OpenCV's COLOR_BGR5652BGR reads the pair low byte first; this
         # sensor emits high byte first, measured by the DIAG scorer (hi-first
         # 0.69 against lo-first 0.24). So the pair is swapped before handing it
@@ -744,6 +745,11 @@ class ProbeLink:
                                         else None)
                     cal = data.get("calib")
                     self.calib_ok = (bool(cal) if cal is not None else None)
+                    if "sp" in data:
+                        try:
+                            self.sensor_preset = (int(data["sp"]), "")
+                        except (TypeError, ValueError):
+                            pass
             elif st == "test_pattern":
                 self.test_pattern = bool(data.get("on"))
             elif st == "raw_stream":
@@ -751,6 +757,14 @@ class ProbeLink:
             elif st == "colour_mode":
                 try:
                     self.colour_mode = int(data.get("mode", 0))
+                except (TypeError, ValueError):
+                    pass
+            elif st == "sensor_preset":
+                try:
+                    self.sensor_preset = (int(data.get("n", 0)),
+                                          str(data.get("name", "")))
+                    if "cm" in data:
+                        self.colour_mode = int(data["cm"])
                 except (TypeError, ValueError):
                     pass
 
@@ -773,6 +787,7 @@ class ProbeLink:
                 "fw": self.fw,
                 "fw_ver": self.fw_ver,
                 "colour_mode": self.colour_mode,
+                "sensor_preset": self.sensor_preset,
                 "raw_stream": self.raw_stream,
                 "test_pattern": self.test_pattern,
                 "calib_ok": self.calib_ok,
@@ -804,8 +819,9 @@ class SimLink:
         self.still = False
         self.state = "online"
         self.fw = "ready"
-        self.fw_ver = (3, 3)
+        self.fw_ver = (3, 7)
         self.colour_mode = 1
+        self.sensor_preset = (0, "rgb565 driver default")
         self.calib_ok = True
         self.raw = None
         self.raw_seq = 0
@@ -853,6 +869,12 @@ class SimLink:
         elif b in (ord("0"), ord("1"), ord("2")):
             with self.lock:
                 self.colour_mode = b - ord("0")
+        elif b in (ord("n"), ord("N"), ord("p"), ord("P")):
+            with self.lock:
+                n = (self.sensor_preset[0] + (1 if b in (ord("n"), ord("N"))
+                                              else 8)) % 9
+                self.sensor_preset = (n, "sim preset %d" % n)
+                self.colour_mode = 2 if n in (1, 2) else 0
         elif b in (ord("r"), ord("R")):
             with self.lock:
                 f = self.frame
@@ -902,6 +924,7 @@ class SimLink:
         with self.lock:
             return {"state": "online", "fw": self.fw, "calibrating": False,
                     "fw_ver": self.fw_ver, "colour_mode": self.colour_mode,
+                    "sensor_preset": self.sensor_preset,
                     "calib_ok": self.calib_ok, "raw_seq": self.raw_seq,
                     "camera_failed": False, "generation": self.generation,
                     "imu_age": now - self.imu_time if self.imu_time else 1e9,
@@ -1516,6 +1539,9 @@ class App:
         self.button(pad, H - pad - int(H * 0.055) - int(H * 0.085), "DIAG",
                     "#4e5d3a", self.toggle_diag, max(10, int(H / 38)),
                     store=self.hud, anchor="sw")
+        self.button(pad, H - pad - int(H * 0.055) - int(H * 0.170), "SENSOR",
+                    "#5d4037", self.next_preset, max(10, int(H / 38)),
+                    store=self.hud, anchor="sw")
 
         panel = int(min(W, H) * 0.33)
         px, py = W - panel - pad, pad
@@ -1596,6 +1622,25 @@ class App:
         if not self.link.send_byte(ord("c")):
             self.toast("PROBE NOT CONNECTED", WARN)
 
+    def next_preset(self, back=False):
+        """
+        Step the probe's sensor register preset (see SENSOR PRESETS in the
+        firmware). The Pi-side white balance is switched off first: it would
+        mask exactly the differences we are trying to see. Press until the
+        picture looks natural, then report the preset number.
+        """
+        h = self.link.health()
+        fv = h.get("fw_ver")
+        if fv is None or fv < (3, 7):
+            self.toast("PROBE FIRMWARE HAS NO SENSOR PRESETS \u2014 FLASH v3.7",
+                       WARN, ms=2600)
+            return
+        if getattr(self, "awb", False):
+            self.awb = False
+            self.save_cfg()
+        if not self.link.send_byte(ord("p" if back else "n")):
+            self.toast("PROBE NOT CONNECTED", WARN)
+
     def toggle_diag(self):
         """
         Ask the probe for one RAW frame and freeze an interpretation grid on
@@ -1650,6 +1695,10 @@ class App:
             self.flip_axis()
         elif k == "d" and self.stage == self.STAGE_RUN:
             self.toggle_diag()
+        elif k == "n" and self.stage == self.STAGE_RUN:
+            self.next_preset()
+        elif k == "p" and self.stage == self.STAGE_RUN:
+            self.next_preset(back=True)
         elif k == "t" and self.stage == self.STAGE_RUN:
             self.toggle_test_pattern()
         elif k == "r" and self.stage == self.STAGE_RUN:
@@ -1810,6 +1859,15 @@ class App:
                     names = {0: "RAW", 1: "BYTE-SWAP", 2: "YUV"}
                     self.toast("COLOUR MODE {} \u2014 {}".format(
                         cm, names.get(cm, "?")), OK, ms=1600)
+            sp = h.get("sensor_preset")
+            if sp is not None and sp != getattr(self, "_last_sp", None):
+                prev_sp = getattr(self, "_last_sp", None)
+                self._last_sp = sp
+                if prev_sp is not None and sp[1]:
+                    # Wins over the colour toast fired just above: the preset
+                    # is the thing the operator pressed for.
+                    self.toast("SENSOR PRESET {} \u2014 {}".format(sp[0], sp[1]),
+                               OK, ms=2600)
             if h.get("raw_seq", 0) != self._raw_seen:
                 raw, self._raw_seen = self.link.take_raw()
                 grid, best, report = (build_diag_grid(
@@ -1887,6 +1945,9 @@ class App:
                 bits.append("TESTPAT")
             if self.diag_photo is not None:
                 bits.append("DIAG")
+            sp = h.get("sensor_preset")
+            if sp is not None:
+                bits.append("SP{}".format(sp[0]))
             if h["state"] != "online":
                 bits.append(h["state"].upper())
             if still:
