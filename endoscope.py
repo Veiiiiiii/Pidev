@@ -9,6 +9,7 @@ lens is aimed, for work where the probe is out of sight.
     python3 endoscope.py --windowed         # development on a desktop
     python3 endoscope.py --sim --windowed   # no hardware at all: synthetic probe
     python3 endoscope.py --port /dev/ttyACM0
+    python3 endoscope.py --official         # stock M5 firmware: UVC + IMU WiFi
     python3 endoscope.py --log drift.csv    # record az/el vs time for analysis
 
 KEYS (besides the touch buttons): Z = zero, A = axis, S = start, Esc = exit.
@@ -73,14 +74,19 @@ SETUP ON THE PI
     sudo usermod -aG dialout $USER      # then REBOOT
 """
 import argparse
+import base64
 import csv
 import glob
+import hashlib
 import json
 import math
 import os
+import socket
+import struct
 import sys
 import threading
 import time
+from urllib.parse import urlsplit
 
 try:
     import serial
@@ -110,7 +116,8 @@ from PIL import Image, ImageTk
 
 CONFIG = os.path.join(os.path.expanduser("~"), ".config", "endoscope.json")
 SYNC = b"\xa5\x5a"
-APP_VER = "4.6"
+APP_VER = "5.0"
+CONFIG_REV = 6
 
 TYPE_IMU = 1
 TYPE_FRAME = 2
@@ -147,6 +154,10 @@ ARROW = ["#7d8a91", "#98a5ac", "#b4c1c8", "#d2dee4", "#f2f7fa"]
 DIM = "#78909c"
 MUTED = "#546e7a"
 WARN = "#ffb300"
+# Flip buttons: filled accent when engaged, dark slate when off, so their
+# state reads from across a workshop without squinting at the label.
+FLIP_ON = "#26a69a"
+FLIP_OFF = "#37474f"
 ALERT = "#ef5350"
 OK = "#66bb6a"
 
@@ -548,6 +559,34 @@ def find_port(preferred=None):
     return None
 
 
+def find_video(preferred="auto"):
+    """Resolve a V4L2 node, preferring the AtomS3R-CAM by its kernel name."""
+    if preferred not in (None, "", "auto"):
+        return int(preferred) if str(preferred).isdigit() else preferred
+
+    nodes = sorted(glob.glob("/dev/video*"))
+    if not nodes:
+        return None
+
+    ranked = []
+    for node in nodes:
+        name = ""
+        try:
+            base = os.path.basename(node)
+            with open("/sys/class/video4linux/{}/name".format(base),
+                      encoding="utf-8") as f:
+                name = f.read().strip().lower()
+        except OSError:
+            pass
+        score = 0
+        if "atoms3r" in name or "atom s3r" in name:
+            score += 100
+        if "uvc" in name or "camera" in name:
+            score += 10
+        ranked.append((score, node))
+    return max(ranked, key=lambda item: (item[0], -int(item[1][10:])))[1]
+
+
 class V4L2Source:
     """
     Video from a standard UVC camera, read by V4L2 through OpenCV.
@@ -564,7 +603,7 @@ class V4L2Source:
     attitude, none of that code runs at all.
     """
 
-    def __init__(self, index, width=1280, height=720):
+    def __init__(self, index="auto", width=640, height=480):
         self.index = index
         self.want = (width, height)
         self.cap = None
@@ -577,10 +616,12 @@ class V4L2Source:
         self._fps = []
 
     def start(self):
-        src = self.index
-        if isinstance(src, str) and src.isdigit():
-            src = int(src)
-        self.cap = cv2.VideoCapture(src)
+        src = find_video(self.index)
+        if src is None:
+            raise RuntimeError("no /dev/video device found; flash the official "
+                               "AtomS3R-CAM UVC firmware and reconnect USB")
+        self.index = src
+        self.cap = cv2.VideoCapture(src, cv2.CAP_V4L2)
         if not self.cap.isOpened():
             raise RuntimeError("cannot open camera {}. Try: ls /dev/video*"
                                .format(self.index))
@@ -618,17 +659,8 @@ class V4L2Source:
             return len(self._fps) / 2.0
 
     def snapshot(self):
-        """
-        Attitude always comes from the probe. Video comes from the UVC camera
-        when one is attached, so none of the probe's colour handling is in the
-        path at all.
-        """
-        if self.camera is not None:
-            frame, seq, _ = self.camera.snapshot()
-            with self.lock:
-                return frame, seq, self.quat, self.still
         with self.lock:
-            return self.frame, self.frame_seq, self.quat, self.still
+            return self.frame, self.frame_seq, self.frame_time
 
     def stop(self):
         self.running = False
@@ -654,6 +686,10 @@ class ProbeLink:
     to know when to force a re-zero.
     """
 
+    #: Millisecond gap in the probe clock that counts as lost integration
+    #: time rather than ordinary jitter (50 Hz nominal = 20 ms per sample).
+    GAP_MS = 120
+
     def __init__(self, port=None, baud=115200):
         self.want_port = port
         self.baud = baud
@@ -661,6 +697,13 @@ class ProbeLink:
         self.ser = None
         self.buf = bytearray()
         self.lock = threading.Lock()
+        # v6 link-quality counters, reported on the check screen and in the
+        # status line. imu_gap_ms is the total probe-clock time for which no
+        # attitude sample arrived; that is heading error already banked.
+        self.dev_time = None
+        self.imu_gaps = 0
+        self.imu_gap_ms = 0.0
+        self.worst_gap_ms = 0.0
 
         self.frame = None
         self.frame_seq = 0
@@ -823,10 +866,33 @@ class ProbeLink:
                 return
             q = data.get("q")
             if q and len(q) == 4:
+                # "t" is the probe's own millisecond clock at the moment the
+                # sample was integrated. It is the only trustworthy timeline:
+                # arrival time on the Pi includes USB scheduling and Python
+                # wake-up jitter. Gaps in it are the measurement that says
+                # whether heading can still be believed -- attitude is an
+                # INTEGRAL, so time the probe spent rotating while packets
+                # were missing is error that never comes back on its own.
+                dev_t = data.get("t")
                 with self.lock:
                     self.quat = tuple(q)
                     self.still = bool(data.get("st"))
                     self.imu_time = time.monotonic()
+                    if isinstance(dev_t, (int, float)):
+                        if self.dev_time is not None:
+                            gap_ms = dev_t - self.dev_time
+                            # 50 Hz nominal => 20 ms. Anything past 120 ms is
+                            # several lost samples, not ordinary jitter.
+                            if gap_ms > 120:
+                                self.imu_gaps += 1
+                                self.imu_gap_ms += gap_ms
+                                self.worst_gap_ms = max(self.worst_gap_ms,
+                                                        gap_ms)
+                            elif gap_ms < 0:
+                                # Probe rebooted: its clock restarted, so any
+                                # zero reference captured before is garbage.
+                                self.imu_gaps += 1
+                        self.dev_time = float(dev_t)
 
         elif ptype == TYPE_RAW:
             payload = bytes(payload)
@@ -972,6 +1038,10 @@ class ProbeLink:
     # ---- what the UI reads
 
     def snapshot(self):
+        if self.camera is not None:
+            frame, seq, _ = self.camera.snapshot()
+            with self.lock:
+                return frame, seq, self.quat, self.still
         with self.lock:
             return self.frame, self.frame_seq, self.quat, self.still
 
@@ -1003,10 +1073,374 @@ class ProbeLink:
                 "frame_age": ((now - self.camera.frame_time)
                               if self.camera is not None and self.camera.frame_time
                               else (now - self.frame_time if self.frame_time else 1e9)),
-                "fps": len(self._fps) / 2.0,
+                "fps": (self.camera.fps() if self.camera is not None
+                        else len(self._fps) / 2.0),
                 "bad": self.bad_packets,
+                # v6: lost integration time. Non-zero here is the honest
+                # reason a heading stopped matching reality.
+                "imu_gaps": self.imu_gaps,
+                "imu_gap_ms": self.imu_gap_ms,
+                "worst_gap_ms": self.worst_gap_ms,
                 "port": self.port,
             }
+
+
+class MahonyFusion:
+    """The proven probe-side attitude filter, for the stock-firmware route."""
+
+    KP = 2.0
+    KI = 0.05
+    STILL_GYRO_DPS = 1.5
+    STILL_ACC_TOL = 0.06
+    STILL_S = 0.5
+    BIAS_LEARN = 0.01       # stock IMU WebSocket is 10 Hz, not 100 Hz
+    BIAS_CLAMP_DPS = 3.0
+    CAL_SAMPLES = 30        # three seconds at the stock 10 Hz rate
+
+    def __init__(self):
+        self.reset()
+
+    def reset(self):
+        self.q = [1.0, 0.0, 0.0, 0.0]
+        self.bias = [0.0, 0.0, 0.0]
+        self.cal_bias = [0.0, 0.0, 0.0]
+        self.integral = [0.0, 0.0, 0.0]
+        self.last_time = None
+        self.still_since = None
+        self.still = False
+        self.calibrated = False
+        self.cal_window = []
+
+    def _seed_from_gravity(self, ax, ay, az):
+        n = math.sqrt(ax * ax + ay * ay + az * az)
+        if n < 0.5:
+            return
+        ax, ay, az = ax / n, ay / n, az / n
+        pitch = math.atan2(-ax, math.sqrt(ay * ay + az * az))
+        roll = math.atan2(ay, az)
+        cp, sp = math.cos(pitch * 0.5), math.sin(pitch * 0.5)
+        cr, sr = math.cos(roll * 0.5), math.sin(roll * 0.5)
+        self.q = [cr * cp, sr * cp, cr * sp, -sr * sp]
+
+    def _calibrate(self, gyro):
+        if self.calibrated:
+            return
+        self.cal_window.append(tuple(gyro))
+        if len(self.cal_window) < self.CAL_SAMPLES:
+            return
+        spread = max(max(row[i] for row in self.cal_window) -
+                     min(row[i] for row in self.cal_window) for i in range(3))
+        if spread < 3.0:
+            self.bias = [sum(row[i] for row in self.cal_window) /
+                         len(self.cal_window) for i in range(3)]
+            self.cal_bias = list(self.bias)
+            self.calibrated = True
+        else:
+            # Movement poisoned this window. Keep a short tail so calibration
+            # restarts quickly as soon as the probe is actually held still.
+            self.cal_window = self.cal_window[-5:]
+
+    def update(self, accel, gyro, now=None):
+        now = time.monotonic() if now is None else now
+        ax, ay, az = (float(x) for x in accel)
+        gx, gy, gz = (float(x) for x in gyro)
+
+        if self.last_time is None:
+            self._seed_from_gravity(ax, ay, az)
+            self.last_time = now
+            self._calibrate((gx, gy, gz))
+            return tuple(self.q), self.still
+
+        dt = now - self.last_time
+        self.last_time = now
+        if dt <= 0.0 or dt > 0.5:
+            dt = 0.1
+        self._calibrate((gx, gy, gz))
+
+        rx, ry, rz = gx - self.bias[0], gy - self.bias[1], gz - self.bias[2]
+        rate = math.sqrt(rx * rx + ry * ry + rz * rz)
+        anorm = math.sqrt(ax * ax + ay * ay + az * az)
+        quiet = (rate < self.STILL_GYRO_DPS and
+                 abs(anorm - 1.0) < self.STILL_ACC_TOL)
+        if not quiet:
+            self.still_since = None
+            self.still = False
+        else:
+            if self.still_since is None:
+                self.still_since = now
+            if now - self.still_since >= self.STILL_S:
+                self.still = True
+                if self.calibrated:
+                    for i, raw in enumerate((gx, gy, gz)):
+                        b = self.bias[i] + self.BIAS_LEARN * (raw - self.bias[i])
+                        self.bias[i] = clamp(
+                            b, self.cal_bias[i] - self.BIAS_CLAMP_DPS,
+                            self.cal_bias[i] + self.BIAS_CLAMP_DPS)
+
+        w, x, y, z = self.q
+        wx, wy, wz = (math.radians(gx - self.bias[0]),
+                      math.radians(gy - self.bias[1]),
+                      math.radians(gz - self.bias[2]))
+        if anorm > 0.5 and abs(anorm - 1.0) < 0.25:
+            axn, ayn, azn = ax / anorm, ay / anorm, az / anorm
+            vx = 2.0 * (x * z - w * y)
+            vy = 2.0 * (w * x + y * z)
+            vz = w * w - x * x - y * y + z * z
+            ex = ayn * vz - azn * vy
+            ey = azn * vx - axn * vz
+            ez = axn * vy - ayn * vx
+            self.integral[0] += self.KI * ex * dt
+            self.integral[1] += self.KI * ey * dt
+            self.integral[2] += self.KI * ez * dt
+            wx += self.KP * ex + self.integral[0]
+            wy += self.KP * ey + self.integral[1]
+            wz += self.KP * ez + self.integral[2]
+
+        dw = 0.5 * (-x * wx - y * wy - z * wz)
+        dx = 0.5 * (w * wx + y * wz - z * wy)
+        dy = 0.5 * (w * wy - x * wz + z * wx)
+        dz = 0.5 * (w * wz + x * wy - y * wx)
+        q = [w + dw * dt, x + dx * dt, y + dy * dt, z + dz * dt]
+        n = math.sqrt(sum(v * v for v in q))
+        if n > 1e-9:
+            self.q = [v / n for v in q]
+        return tuple(self.q), self.still
+
+
+class WsJsonStream:
+    """Small dependency-free WebSocket client for the official IMU endpoint."""
+
+    def __init__(self, url, timeout=3.0):
+        self.url = url
+        self.timeout = timeout
+        self.sock = None
+
+    def connect(self):
+        u = urlsplit(self.url)
+        if u.scheme != "ws" or not u.hostname:
+            raise ValueError("IMU URL must be ws://host/path")
+        port = u.port or 80
+        path = u.path or "/"
+        if u.query:
+            path += "?" + u.query
+        sock = socket.create_connection((u.hostname, port), self.timeout)
+        sock.settimeout(self.timeout)
+        key = base64.b64encode(os.urandom(16)).decode("ascii")
+        req = ("GET {} HTTP/1.1\r\nHost: {}:{}\r\nUpgrade: websocket\r\n"
+               "Connection: Upgrade\r\nSec-WebSocket-Key: {}\r\n"
+               "Sec-WebSocket-Version: 13\r\n\r\n").format(
+                   path, u.hostname, port, key)
+        sock.sendall(req.encode("ascii"))
+        header = bytearray()
+        while b"\r\n\r\n" not in header:
+            part = sock.recv(1)
+            if not part or len(header) > 16384:
+                raise ConnectionError("incomplete WebSocket handshake")
+            header.extend(part)
+        text_header = header.decode("iso-8859-1")
+        if " 101 " not in text_header.split("\r\n", 1)[0]:
+            raise ConnectionError("WebSocket upgrade rejected")
+        expected = base64.b64encode(hashlib.sha1(
+            (key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11")
+            .encode("ascii")).digest()).decode("ascii")
+        if "sec-websocket-accept: " + expected.lower() not in text_header.lower():
+            raise ConnectionError("invalid WebSocket accept key")
+        self.sock = sock
+        return self
+
+    def _read_exact(self, n):
+        out = bytearray()
+        while len(out) < n:
+            part = self.sock.recv(n - len(out))
+            if not part:
+                raise ConnectionError("WebSocket closed")
+            out.extend(part)
+        return bytes(out)
+
+    def _send(self, opcode, payload=b""):
+        payload = bytes(payload)
+        first = 0x80 | opcode
+        n = len(payload)
+        if n < 126:
+            head = bytes((first, 0x80 | n))
+        elif n < 65536:
+            head = bytes((first, 0x80 | 126)) + struct.pack("!H", n)
+        else:
+            head = bytes((first, 0x80 | 127)) + struct.pack("!Q", n)
+        mask = os.urandom(4)
+        masked = bytes(v ^ mask[i & 3] for i, v in enumerate(payload))
+        self.sock.sendall(head + mask + masked)
+
+    def recv_json(self):
+        chunks = []
+        opcode0 = None
+        while True:
+            b0, b1 = self._read_exact(2)
+            final, opcode = bool(b0 & 0x80), b0 & 0x0f
+            masked, n = bool(b1 & 0x80), b1 & 0x7f
+            if n == 126:
+                n = struct.unpack("!H", self._read_exact(2))[0]
+            elif n == 127:
+                n = struct.unpack("!Q", self._read_exact(8))[0]
+            mask = self._read_exact(4) if masked else None
+            payload = self._read_exact(n)
+            if mask:
+                payload = bytes(v ^ mask[i & 3] for i, v in enumerate(payload))
+            if opcode == 0x8:
+                raise ConnectionError("WebSocket close frame")
+            if opcode == 0x9:
+                self._send(0xA, payload)
+                continue
+            if opcode == 0xA:
+                continue
+            if opcode in (0x1, 0x2):
+                opcode0 = opcode
+                chunks = [payload]
+            elif opcode == 0x0 and opcode0 is not None:
+                chunks.append(payload)
+            else:
+                continue
+            if final:
+                if opcode0 != 0x1:
+                    chunks, opcode0 = [], None
+                    continue
+                return json.loads(b"".join(chunks).decode("utf-8"))
+
+    def close(self):
+        if self.sock is not None:
+            try:
+                self.sock.close()
+            except OSError:
+                pass
+            self.sock = None
+
+
+class OfficialProbeLink:
+    """Stock M5Stack firmware: UVC video plus its IMU WebSocket."""
+
+    is_uvc = True
+
+    def __init__(self, video="auto", width=640, height=480,
+                 imu_url="ws://192.168.4.1/api/v1/ws/imu_data"):
+        self.camera = V4L2Source(video, width, height)
+        self.imu_url = imu_url
+        self.fusion = MahonyFusion()
+        self.lock = threading.Lock()
+        self.quat = (1.0, 0.0, 0.0, 0.0)
+        self.still = False
+        self.state = "searching"
+        self.fw = "official_uvc"
+        self.fw_ver = None
+        self.calib_ok = None
+        self.calibrating = True
+        self.camera_failed = False
+        self.generation = 0
+        self.imu_time = 0.0
+        self.bad_packets = 0
+        self.running = False
+        self.stream = None
+        self.status = []
+        self.raw_swap = False
+        self.raw_stream = False
+        self.test_pattern = False
+        self.colour_mode = None
+        self.sensor_preset = None
+        self.sensor_regs = ""
+        self.regs_seq = 0
+        self.reg_ack = None
+
+    def start(self):
+        try:
+            self.camera.start()
+        except Exception as exc:
+            self.camera_failed = True
+            self.status.append({"status": "uvc_failed", "error": str(exc)})
+        self.running = True
+        threading.Thread(target=self._manager, daemon=True).start()
+        return self
+
+    def stop(self):
+        self.running = False
+        if self.stream:
+            self.stream.close()
+        self.camera.stop()
+
+    def _manager(self):
+        while self.running:
+            with self.lock:
+                self.state = "connecting"
+            try:
+                self.stream = WsJsonStream(self.imu_url).connect()
+                self.fusion.reset()
+                with self.lock:
+                    self.state = "online"
+                    self.generation += 1
+                    self.calibrating = True
+                    self.calib_ok = None
+                while self.running:
+                    data = self.stream.recv_json()
+                    # Official SharedData::UpdateImuData publishes accel X/Y
+                    # swapped but leaves gyro X/Y untouched. Undo only that
+                    # published accel swap so both sensors share one body frame.
+                    accel = (data["ay"], data["ax"], data["az"])
+                    gyro = (data["gx"], data["gy"], data["gz"])
+                    now = time.monotonic()
+                    q, still = self.fusion.update(accel, gyro, now)
+                    with self.lock:
+                        self.quat = q
+                        self.still = still
+                        self.imu_time = now
+                        self.calibrating = not self.fusion.calibrated
+                        self.calib_ok = True if self.fusion.calibrated else None
+            except (OSError, ValueError, KeyError, TypeError,
+                    json.JSONDecodeError, ConnectionError):
+                with self.lock:
+                    self.state = "offline"
+                self.bad_packets += 1
+            finally:
+                if self.stream:
+                    self.stream.close()
+                    self.stream = None
+            if self.running:
+                time.sleep(1.0)
+
+    def snapshot(self):
+        frame, seq, _ = self.camera.snapshot()
+        with self.lock:
+            return frame, seq, self.quat, self.still
+
+    def health(self):
+        now = time.monotonic()
+        with self.lock:
+            return {"state": self.state, "fw": self.fw,
+                    "fw_ver": self.fw_ver, "colour_mode": None,
+                    "sensor_preset": None, "sensor_regs": "",
+                    "regs_seq": 0, "reg_ack": None, "raw_stream": False,
+                    "test_pattern": False, "calib_ok": self.calib_ok,
+                    "raw_seq": 0, "calibrating": self.calibrating,
+                    "camera_failed": self.camera_failed,
+                    "generation": self.generation,
+                    "imu_age": now - self.imu_time if self.imu_time else 1e9,
+                    "frame_age": (now - self.camera.frame_time
+                                  if self.camera.frame_time else 1e9),
+                    "fps": self.camera.fps(), "bad": self.bad_packets,
+                    # The stock Wi-Fi route publishes no device clock, so gap
+                    # accounting is unavailable -- reported as -1 rather than
+                    # 0, which would falsely read as "no losses".
+                    "imu_gaps": -1, "imu_gap_ms": -1.0, "worst_gap_ms": -1.0,
+                    "port": self.imu_url}
+
+    def send_bytes(self, _):
+        return False
+
+    def send_byte(self, _):
+        return False
+
+    def get_regs(self):
+        return {}, None
+
+    def take_raw(self):
+        return None, 0
 
 
 class SimLink:
@@ -1019,6 +1453,7 @@ class SimLink:
 
     def __init__(self):
         self.lock = threading.Lock()
+        self.camera = None
         self.frame = None
         self.frame_seq = 0
         self.quat = (1.0, 0.0, 0.0, 0.0)
@@ -1167,7 +1602,8 @@ class SimLink:
                     "frame_age": ((now - self.camera.frame_time)
                               if self.camera is not None and self.camera.frame_time
                               else (now - self.frame_time if self.frame_time else 1e9)),
-                    "fps": 12.5, "bad": 0, "port": "sim"}
+                    "fps": 12.5, "bad": 0, "port": "sim",
+                    "imu_gaps": 0, "imu_gap_ms": 0.0, "worst_gap_ms": 0.0}
 
 
 # ------------------------------------------------------------- indicator
@@ -1326,6 +1762,8 @@ class App:
         self.link = link
         self.args = args
         self.cfg = self.load_cfg()
+        self.clean_video = bool(getattr(link, "is_uvc", False) or
+                                getattr(link, "camera", None) is not None)
         self.axis_idx = int(self.cfg.get("axis", 0)) % len(AXES)
         self.q_ref = None
         self.zero_gen = -1              # link generation the zero belongs to
@@ -1337,7 +1775,17 @@ class App:
         self.check_hint = None          # CHECK's first guidance line
         self._hint_state = ""           # wait / armed / locked
         self._last_cm = None            # last colour mode we toasted about
-        self.rot180 = bool(self.cfg.get("rot180", True))
+        self.rot180 = bool(self.cfg.get("rot180", False))
+        # ---- operator display flips (v6) -------------------------------
+        # These mirror the PICTURE ONLY. They are applied at the very end of
+        # the render path, after every colour step and after rot180, and they
+        # are never fed back into aim_angles() or the indicator. The probe's
+        # body axes are a physical fact; letting a display button rotate them
+        # is exactly how v3.1 ended up saving a wrong axis. See HANDOFF S4.
+        self.flip_btn = {}          # {"flip_h": (rect_id, text_id), ...}
+        self.mirror_flag = None     # persistent "MIRRORED" HUD warning
+        self.flip_h = bool(self.cfg.get("flip_h", False))   # mirror left/right
+        self.flip_v = bool(self.cfg.get("flip_v", False))   # mirror up/down
         # Up/down polarity, set once with FLIP U/D and never touched
         # by zeroing or by the axis detector.
         # Default is INVERTED: on this build of the probe the lens axis the
@@ -1345,8 +1793,9 @@ class App:
         # a drop until FLIP U/D was pressed every session. Baked in; the
         # button stays so a differently-mounted probe can undo it.
         self.el_sign = 1.0 if self.cfg.get("el_sign", -1) > 0 else -1.0
-        self.awb = bool(self.cfg.get("awb", True))
-        self.tune_saved = self.cfg.get("tune")      # last DONE'd tuning, if any
+        self.awb = bool(self.cfg.get("awb", False))
+        self.tune_saved = (self.cfg.get("tune")
+                           if args.legacy_colour_tools else None)
         cal = self.cfg.get("cal") or {}
         self.pi_gains = [float(x) for x in cal.get("gains", [1.0, 1.0, 1.0])]  # B,G,R
         self.pi_chan = [int(x) for x in cal.get("chan", [0, 1, 2])]            # BGR index map
@@ -1449,16 +1898,34 @@ class App:
     def load_cfg(self):
         try:
             with open(CONFIG, encoding="utf-8") as f:
-                return json.load(f)
+                cfg = json.load(f)
+            if int(cfg.get("config_rev", 0)) == CONFIG_REV:
+                return cfg
+            # v4.x persisted experimental sensor registers, colour matrices,
+            # grey-world AWB and a 180-degree compensation. Replaying those
+            # settings is enough to corrupt a now-correct official frame, so
+            # migrate only the proven orientation choices.
+            # v5 and earlier had no independent flips. Orientation choices
+            # (which body axis the lens looks along, and the up/down polarity)
+            # are hard-won and must survive; everything colour-related is
+            # deliberately dropped, and the flips start off.
+            return {"config_rev": CONFIG_REV,
+                    "axis": int(cfg.get("axis", 0)),
+                    "el_sign": float(cfg.get("el_sign", -1)),
+                    "rot180": False, "awb": False, "swap_rb": False,
+                    "flip_h": False, "flip_v": False}
         except Exception:
-            return {}
+            return {"config_rev": CONFIG_REV}
 
     def save_cfg(self):
         try:
             os.makedirs(os.path.dirname(CONFIG), exist_ok=True)
             with open(CONFIG, "w", encoding="utf-8") as f:
-                json.dump({"axis": self.axis_idx,
+                json.dump({"config_rev": CONFIG_REV,
+                           "axis": self.axis_idx,
                            "rot180": self.rot180,
+                           "flip_h": self.flip_h,
+                           "flip_v": self.flip_v,
                            "el_sign": self.el_sign,
                            "awb": self.awb,
                            "swap_rb": self.swap_rb,
@@ -1612,7 +2079,9 @@ class App:
 
     def link_ready(self):
         h = self.link.health()
-        return h["state"] == "online" and h["imu_age"] < 1.0
+        return (h["state"] == "online" and h["imu_age"] < 1.0
+                and not h.get("calibrating", False)
+                and h.get("calib_ok") is not False)
 
     def capture_zero(self):
         if not self.link_ready():
@@ -1823,21 +2292,39 @@ class App:
                     store=self.hud, anchor="nw")
         self.button(W - pad, H - pad, "ZERO", "#1565c0", self.zero_inplace,
                     bs, store=self.hud, anchor="se")
-        self.button(pad, H - pad - int(H * 0.055), "COLOR", "#455a64",
-                    self.cycle_colour, max(10, int(H / 38)),
-                    store=self.hud, anchor="sw")
-        self.button(pad, H - pad - int(H * 0.055) - int(H * 0.085), "DIAG",
-                    "#4e5d3a", self.toggle_diag, max(10, int(H / 38)),
-                    store=self.hud, anchor="sw")
-        self.button(pad, H - pad - int(H * 0.055) - int(H * 0.170), "TUNE",
-                    "#5d4037", lambda: self.set_stage(self.STAGE_TUNE),
-                    max(10, int(H / 38)), store=self.hud, anchor="sw")
+        if self.args.legacy_colour_tools and not self.clean_video:
+            self.button(pad, H - pad - int(H * 0.055), "COLOR", "#455a64",
+                        self.cycle_colour, max(10, int(H / 38)),
+                        store=self.hud, anchor="sw")
+            self.button(pad, H - pad - int(H * 0.055) - int(H * 0.085), "DIAG",
+                        "#4e5d3a", self.toggle_diag, max(10, int(H / 38)),
+                        store=self.hud, anchor="sw")
+            self.button(pad, H - pad - int(H * 0.055) - int(H * 0.170), "TUNE",
+                        "#5d4037", lambda: self.set_stage(self.STAGE_TUNE),
+                        max(10, int(H / 38)), store=self.hud, anchor="sw")
         # Sensor register dump from the last SENSOR press: lets the chip's
         # real state be read off a photograph of the screen.
         self.regs_item = self.canvas.create_text(
             W * 0.21, H - pad, anchor="sw", text="", fill="#9ccc65",
             font=self.f(max(9, int(H / 54))))
         self.hud.append(self.regs_item)
+
+        # ---- display flip buttons (v6) ---------------------------------
+        # Bottom-right, stacked above ZERO so the thumb reaches all three
+        # without crossing the picture. They only ever touch the displayed
+        # frame; the indicator keeps reading the probe's real attitude.
+        fbs = max(11, int(H / 36))
+        zero_h = fbs * 2 + 30
+        fy = H - pad - zero_h - int(H * 0.020)
+        r, t, fw_btn, fh_btn = self.button(
+            W - pad, fy, "FLIP V", FLIP_ON if self.flip_v else FLIP_OFF,
+            self.toggle_flip_v, fbs, store=self.hud, anchor="se")
+        self.flip_btn["flip_v"] = (r, t)
+        r, t, _, _ = self.button(
+            W - pad, fy - fh_btn - int(H * 0.018), "FLIP H",
+            FLIP_ON if self.flip_h else FLIP_OFF,
+            self.toggle_flip_h, fbs, store=self.hud, anchor="se")
+        self.flip_btn["flip_h"] = (r, t)
 
         panel = int(min(W, H) * 0.33)
         px, py = W - panel - pad, pad
@@ -1853,6 +2340,13 @@ class App:
                                      text="", fill=DIM,
                                      font=self.f(max(9, panel // 17)))
         self.hud.append(self.readout)
+        # A mirrored picture moves opposite to the arrow. That is dangerous
+        # while steering, so the warning sits ON the indicator panel, where
+        # the operator is already looking, not in the status line.
+        self.mirror_flag = c.create_text(
+            px + panel / 2, py + panel * 0.99, text="", fill=WARN,
+            font=self.f(max(8, panel // 19), True), state="hidden")
+        self.hud.append(self.mirror_flag)
         self.statusbar = c.create_text(pad, H - pad, anchor="sw", text="",
                                        fill=MUTED,
                                        font=self.f(max(8, H // 62)))
@@ -1862,6 +2356,75 @@ class App:
                                       font=self.f(max(15, int(H / 20)), True),
                                       state="hidden")
         self.hud.append(self.nosignal)
+        # Flips persist across restarts, so paint the buttons and the mirror
+        # warning to match what was restored from the config file.
+        self._refresh_flip_labels()
+
+    def _apply_flips(self, img):
+        """
+        Mirror the displayed frame. Picture only -- never the attitude.
+
+        cv2.flip codes: 1 = about the vertical axis (left/right mirror),
+        0 = about the horizontal axis (up/down), -1 = both, which is the same
+        result as a 180-degree rotation. Doing both in one call is cheaper
+        than two passes over the buffer, which matters on a Pi pushing frames
+        at video rate.
+        """
+        if self.flip_h and self.flip_v:
+            return cv2.flip(img, -1)
+        if self.flip_h:
+            return cv2.flip(img, 1)
+        if self.flip_v:
+            return cv2.flip(img, 0)
+        return img
+
+    def toggle_flip_h(self):
+        """
+        Mirror left/right.
+
+        WARNING SHOWN TO THE OPERATOR: a horizontal mirror decouples the
+        picture from the direction indicator. The probe still physically
+        turns right when the arrow says right, but a mirrored image will
+        appear to move LEFT. That is a real hazard when steering by video, so
+        the HUD carries a persistent marker while this is on. A vertical flip
+        does not have this problem for left/right, so it gets no marker.
+        """
+        self.flip_h = not self.flip_h
+        self.save_cfg()
+        self._refresh_flip_labels()
+        if self.flip_h:
+            self.toast("MIRRORED \u2014 image left/right is reversed "
+                       "vs the arrow", WARN, ms=2600)
+        else:
+            self.toast("Mirror off", OK)
+
+    def toggle_flip_v(self):
+        """Flip the picture up/down. Does not affect the indicator."""
+        self.flip_v = not self.flip_v
+        self.save_cfg()
+        self._refresh_flip_labels()
+        self.toast("Flip V on" if self.flip_v else "Flip V off", OK)
+
+    def _refresh_flip_labels(self):
+        """Repaint the two flip buttons so their state is visible at a glance."""
+        for key, on in (("flip_h", self.flip_h), ("flip_v", self.flip_v)):
+            item = self.flip_btn.get(key)
+            if not item:
+                continue
+            rect, label = item
+            try:
+                self.canvas.itemconfigure(rect, fill=(FLIP_ON if on
+                                                      else FLIP_OFF))
+                self.canvas.itemconfigure(label, fill=("#0d1117" if on
+                                                       else "#ffffff"))
+            except Exception:
+                pass
+        # Persistent mirror warning next to the indicator.
+        if getattr(self, "mirror_flag", None):
+            self.canvas.itemconfigure(
+                self.mirror_flag,
+                text="MIRRORED" if self.flip_h else "",
+                state="normal" if self.flip_h else "hidden")
 
     def toggle_test_pattern(self):
         """
@@ -1914,7 +2477,6 @@ class App:
         # it and would refuse a perfectly capable probe -- which is exactly
         # what happened in the field. Send the byte; an old probe simply
         # ignores it.
-        h = self.link.health()
         if not self.link.send_byte(ord("c")):
             self.toast("PROBE NOT CONNECTED", WARN)
 
@@ -1947,7 +2509,6 @@ class App:
         if self.diag_photo is not None:
             self.diag_photo = None
             return
-        h = self.link.health()
         if self.link.send_byte(ord("r")):
             self.toast("DIAG: requesting raw frame \u2026", DIM, ms=1200)
         else:
@@ -1976,6 +2537,21 @@ class App:
 
     def on_key(self, e):
         k = e.keysym.lower()
+        if (k in ("c", "d", "n", "p", "g", "r", "x", "b", "w", "t")
+                and (not self.args.legacy_colour_tools or self.clean_video)):
+            if self.stage == self.STAGE_RUN:
+                self.toast("OFFICIAL VIDEO PATH — colour overrides disabled",
+                           OK, ms=1400)
+            return
+        # v6: display flips. Deliberately NOT in the colour-override
+        # block above -- flipping is a legitimate operator control on
+        # the official video path, not a colour experiment.
+        if k == "h" and self.stage == self.STAGE_RUN:
+            self.toggle_flip_h()
+            return
+        if k == "j" and self.stage == self.STAGE_RUN:
+            self.toggle_flip_v()
+            return
         if k == "z":
             if self.stage == self.STAGE_RUN:
                 self.zero_inplace()
@@ -2034,6 +2610,20 @@ class App:
     # ---- per-frame update
 
     def probe_status_text(self, h):
+        if getattr(self.link, "is_uvc", False):
+            if h["state"] in ("searching", "connecting"):
+                return ("PROBE: connect Pi Wi-Fi to AtomS3R-CAM-WiFi; "
+                        "waiting for IMU...", DIM)
+            if h["state"] == "offline":
+                return ("PROBE: IMU link offline — check AtomS3R-CAM-WiFi "
+                        "and 192.168.4.1", ALERT)
+            if h["camera_failed"]:
+                return ("PROBE: IMU online, UVC missing — check /dev/video*",
+                        WARN)
+            if h["calibrating"]:
+                return ("PROBE: official UVC online; calibrating gyro — "
+                        "hold it still...", WARN)
+            return "PROBE: official UVC + IMU online", OK
         if h["state"] == "searching":
             return "PROBE: searching for USB device\u2026", DIM
         if h["state"] == "connecting":
@@ -2093,7 +2683,8 @@ class App:
         # The sensor forgets everything on power-up. Whatever the operator
         # DONE'd in TUNE is replayed on every new probe boot, once its own
         # defaults dump has landed.
-        if (self.tune_saved and h.get("fw_ver") is not None
+        if (self.args.legacy_colour_tools and not self.clean_video
+                and self.tune_saved and h.get("fw_ver") is not None
                 and h.get("fw_ver", (0, 0)) >= (3, 10)
                 and h["generation"] != self._tune_gen_applied):
             self._tune_gen_applied = h["generation"]
@@ -2114,7 +2705,9 @@ class App:
                 self.canvas.itemconfigure(self.setup_status,
                                           text=text, fill=col)
             if self.zero_btn:
-                ready = h["state"] == "online" and h["imu_age"] < 1.0
+                ready = (h["state"] == "online" and h["imu_age"] < 1.0
+                         and not h.get("calibrating", False)
+                         and h.get("calib_ok") is not False)
                 self.canvas.itemconfigure(self.zero_btn[0],
                                           fill="#2e7d32" if ready else MUTED)
 
@@ -2170,11 +2763,12 @@ class App:
                          int(dt) // 60, int(dt) % 60, self.peak_az))
 
         elif self.stage == self.STAGE_RUN:
+            uvc = self.clean_video
             cm = h.get("colour_mode")
             if cm is not None and cm != self._last_cm:
                 prev, self._last_cm = self._last_cm, cm
                 if prev is not None:      # not the first report after boot
-                    names = {0: "RAW", 1: "BYTE-SWAP", 2: "YUV"}
+                    names = {0: "OFFICIAL", 1: "LEGACY RGB565", 2: "YUV"}
                     self.toast("COLOUR MODE {} \u2014 {}".format(
                         cm, names.get(cm, "?")), OK, ms=1600)
             regs = h.get("sensor_regs") or ""
@@ -2229,15 +2823,20 @@ class App:
                 scale = min(self.W / fw, self.H / fh)
                 small = cv2.resize(show, (int(fw * scale), int(fh * scale)),
                                    interpolation=cv2.INTER_LINEAR)
-                uvc = self.link.camera is not None
                 if self.swap_rb and self.diag_photo is None and not uvc:
                     # A red/blue transposition survives JPEG intact, so unlike
                     # a bit-order fault it can still be undone here.
                     small = small[:, :, ::-1]
-                if self.diag_photo is None:
+                if self.diag_photo is None and not uvc:
                     small = self._pi_colour(small)
                 if self.awb and self.diag_photo is None and not uvc:
                     small, self._awb_gains = grey_world(small, self._awb_gains)
+                # Operator flips are the LAST thing done to the picture, and
+                # only to the picture. DIAG output is excluded on purpose: it
+                # exists to show the sensor's unaltered truth, and a mirrored
+                # diagnostic would be worse than none.
+                if self.diag_photo is None:
+                    small = self._apply_flips(small)
                 rgb = cv2.cvtColor(small, cv2.COLOR_BGR2RGB)
                 self.photo = ImageTk.PhotoImage(Image.fromarray(rgb))
                 self.canvas.itemconfigure(self.video_item, image=self.photo)
@@ -2263,8 +2862,8 @@ class App:
             bits = ["{:.0f} fps".format(h["fps"])]
             if self.rot180:
                 bits.append("ROT180")
-            if self.link.camera is not None:
-                bits.append("UVC")
+            if uvc:
+                bits.append("OFFICIAL UVC")
             elif self.awb:
                 bits.append("AWB")
             if h.get("raw_stream"):
@@ -3211,11 +3810,18 @@ def main():
     ap.add_argument("--baud", type=int, default=115200)
     ap.add_argument("--video", metavar="N",
                     help="take video from a standard UVC camera instead of the "
-                         "probe, e.g. --video 0 or --video /dev/video0. The "
+                         "serial stream, e.g. --video auto or --video /dev/video0. The "
                          "probe then supplies attitude only, and none of the "
                          "firmware colour handling is in the picture path.")
-    ap.add_argument("--video-size", default="1280x720",
-                    help="requested UVC capture size (default 1280x720)")
+    ap.add_argument("--video-size", default="640x480",
+                    help="requested UVC capture size (default 640x480)")
+    ap.add_argument("--official", action="store_true",
+                    help="use M5Stack stock firmware: UVC video plus raw IMU from "
+                         "ws://192.168.4.1; no custom colour path")
+    ap.add_argument("--imu-ws", default="ws://192.168.4.1/api/v1/ws/imu_data",
+                    help="stock-firmware IMU WebSocket URL")
+    ap.add_argument("--legacy-colour-tools", action="store_true",
+                    help="show the old COLOR/DIAG/TUNE controls (diagnostics only)")
     ap.add_argument("--windowed", action="store_true")
     ap.add_argument("--sim", action="store_true",
                     help="synthetic probe: run the whole UI with no hardware")
@@ -3223,12 +3829,29 @@ def main():
                     help="record time, az, el, quaternion for drift analysis")
     args = ap.parse_args()
 
-    link = (SimLink() if args.sim else ProbeLink(args.port, args.baud)).start()
+    try:
+        vw, vh = (int(x) for x in args.video_size.lower().split("x", 1))
+        if vw < 16 or vh < 16:
+            raise ValueError
+    except ValueError:
+        ap.error("--video-size must look like 640x480")
+
+    if args.sim:
+        link = SimLink().start()
+    elif args.official:
+        link = OfficialProbeLink(args.video or "auto", vw, vh,
+                                 args.imu_ws).start()
+    else:
+        link = ProbeLink(args.port, args.baud)
+        if args.video:
+            link.camera = V4L2Source(args.video, vw, vh).start()
+        link.start()
     app = App(link, args)
     try:
         app.run()
     finally:
-        if getattr(link, 'camera', None):
+        if (getattr(link, 'camera', None) and
+                not getattr(link, 'is_uvc', False)):
             link.camera.stop()
         link.stop()
         if link.status:
