@@ -968,8 +968,13 @@ class App:
         self.rot180 = bool(self.cfg.get("rot180", True))
         # Up/down polarity, set once with FLIP U/D and never touched
         # by zeroing or by the axis detector.
-        self.el_sign = -1.0 if self.cfg.get("el_sign", 1) < 0 else 1.0
+        # Default is INVERTED: on this build of the probe the lens axis the
+        # detector locks is the antipode of the true one, so a lift read as
+        # a drop until FLIP U/D was pressed every session. Baked in; the
+        # button stays so a differently-mounted probe can undo it.
+        self.el_sign = 1.0 if self.cfg.get("el_sign", -1) > 0 else -1.0
         self.awb = bool(self.cfg.get("awb", True))
+        self.swap_rb = bool(self.cfg.get("swap_rb", False))
         self._awb_gains = None
         self.diag_photo = None          # sticky DIAG grid, shown over video
         self._raw_seen = 0
@@ -992,10 +997,17 @@ class App:
             self.H = self.root.winfo_height()
         else:
             self.root.attributes("-fullscreen", True)
+            self.root.attributes("-topmost", True)
+            self.root.overrideredirect(True)
             self.root.configure(cursor="none")
             self.root.update_idletasks()
             self.W = self.root.winfo_screenwidth()
             self.H = self.root.winfo_screenheight()
+            # A window manager, a notification or a stray key can drop a
+            # window out of fullscreen. On a fixed-function instrument that
+            # must never happen, so the state is re-asserted rather than
+            # merely requested once.
+            self._keep_fullscreen()
 
         self.pick_font()
         self._fonts = {}
@@ -1037,7 +1049,8 @@ class App:
                 json.dump({"axis": self.axis_idx,
                            "rot180": self.rot180,
                            "el_sign": self.el_sign,
-                           "awb": self.awb}, f)
+                           "awb": self.awb,
+                           "swap_rb": self.swap_rb}, f)
         except Exception:
             pass
 
@@ -1468,6 +1481,15 @@ class App:
             self.axis_auto = False      # never switch the axis mid-inspection
             self.toast("ZEROED \u2713", OK)
 
+    def _keep_fullscreen(self):
+        try:
+            if not self.root.attributes("-fullscreen"):
+                self.root.attributes("-fullscreen", True)
+            self.root.attributes("-topmost", True)
+        except Exception:
+            return
+        self.root.after(2000, self._keep_fullscreen)
+
     # ---- keyboard shortcuts (development convenience; the device is touch)
 
     def on_key(self, e):
@@ -1487,6 +1509,13 @@ class App:
             self.flip_axis()
         elif k == "d" and self.stage == self.STAGE_RUN:
             self.toggle_diag()
+        elif k == "b" and self.stage == self.STAGE_RUN:
+            self.swap_rb = not self.swap_rb
+            self._awb_gains = None
+            self.save_cfg()
+            self.last_seq = -1
+            self.toast("RED/BLUE SWAP: " + ("ON" if self.swap_rb else "OFF"),
+                       OK, ms=1400)
         elif k == "w" and self.stage == self.STAGE_RUN:
             # Escape hatch: if a scene really is one colour, AWB will bleach
             # it, and the operator needs to be able to see the sensor plain.
@@ -1537,6 +1566,12 @@ class App:
                 return s + " \u2014 flash v3.2 for the colour switch", WARN
             if h.get("colour_mode") is not None:
                 s += " \u00b7 colour {}".format(h["colour_mode"])
+            fv = h.get("fw_ver")
+            if fv is not None and fv < (3, 4):
+                # The commonest cause of "still garbled" is the Pi being
+                # updated while the probe was not. Say so outright instead of
+                # letting it look like a colour bug.
+                s += " \u00b7 OLD FIRMWARE - RE-FLASH"
         return s, OK
 
     def update(self):
@@ -1647,6 +1682,10 @@ class App:
                 scale = min(self.W / fw, self.H / fh)
                 small = cv2.resize(show, (int(fw * scale), int(fh * scale)),
                                    interpolation=cv2.INTER_LINEAR)
+                if self.swap_rb and self.diag_photo is None:
+                    # A red/blue transposition survives JPEG intact, so unlike
+                    # a bit-order fault it can still be undone here.
+                    small = small[:, :, ::-1]
                 if self.awb and self.diag_photo is None:
                     small, self._awb_gains = grey_world(small, self._awb_gains)
                 rgb = cv2.cvtColor(small, cv2.COLOR_BGR2RGB)
