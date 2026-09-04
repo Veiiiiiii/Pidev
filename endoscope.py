@@ -1998,7 +1998,7 @@ class App:
             self.tune_done()
         elif k == "p" and self.stage == self.STAGE_RUN:
             self.next_preset(back=True)
-        elif k == "t" and self.stage == self.STAGE_RUN:
+        elif k == "g" and self.stage == self.STAGE_RUN:
             self.toggle_test_pattern()
         elif k == "r" and self.stage == self.STAGE_RUN:
             self.toggle_raw_stream()
