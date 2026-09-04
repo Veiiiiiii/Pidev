@@ -110,7 +110,7 @@ from PIL import Image, ImageTk
 
 CONFIG = os.path.join(os.path.expanduser("~"), ".config", "endoscope.json")
 SYNC = b"\xa5\x5a"
-APP_VER = "4.3"
+APP_VER = "4.4"
 
 TYPE_IMU = 1
 TYPE_FRAME = 2
@@ -520,6 +520,11 @@ class ProbeLink:
         self.colour_mode = None         # probe's current colour mode, if told
         self.sensor_preset = None       # (n, name) from the probe, if told
         self.sensor_regs = ""           # register dump from the last preset ack
+        self.regs_dict = {}             # parsed {reg: val} from the last dump
+        self.regs_seq = 0
+        self.defaults = None            # first dump of this boot = driver defaults
+        self.reg_ack = None             # (seq, reg, val, readback, ok)
+        self._ack_n = 0
         # OpenCV's COLOR_BGR5652BGR reads the pair low byte first; this
         # sensor emits high byte first, measured by the DIAG scorer (hi-first
         # 0.69 against lo-first 0.24). So the pair is swapped before handing it
@@ -584,6 +589,7 @@ class ProbeLink:
                 self.generation += 1
                 self.fw_ver = None      # fresh boot: wait for its ready line
                 self.colour_mode = None
+                self.defaults = None
             self._set_state("online")
             self._read_until_error()
             try:
@@ -702,21 +708,28 @@ class ProbeLink:
                     self.frame_time = now
                     self._fps.append(now)
 
-    def send_byte(self, b):
+    def send_bytes(self, bs):
         """
-        One command byte to the probe (v3.2+ reads them; older firmware just
+        Command bytes to the probe (v3.2+ reads them; older firmware just
         leaves them in its RX buffer, hence the write timeout). Returns
-        whether the byte was handed to the driver.
+        whether the bytes were handed to the driver.
         """
         ser = self.ser
         if ser is None:
             return False
         try:
             with self._wlock:
-                ser.write(bytes([b]))
+                ser.write(bytes(bs))
             return True
         except Exception:
             return False
+
+    def send_byte(self, b):
+        return self.send_bytes([b])
+
+    def get_regs(self):
+        with self.lock:
+            return dict(self.regs_dict), (dict(self.defaults) if self.defaults else None)
 
     def _handle_status(self, data):
         st = str(data.get("status", ""))
@@ -760,6 +773,30 @@ class ProbeLink:
                     self.colour_mode = int(data.get("mode", 0))
                 except (TypeError, ValueError):
                     pass
+            elif st == "regs":
+                d = {}
+                for tok in str(data.get("regs", "")).split():
+                    if "=" in tok:
+                        a, b = tok.split("=", 1)
+                        try:
+                            d[int(a, 16)] = int(b, 16)
+                        except ValueError:
+                            pass
+                if d:
+                    self.regs_dict = d
+                    self.regs_seq += 1
+                    if self.defaults is None:
+                        self.defaults = dict(d)
+            elif st == "reg":
+                try:
+                    self._ack_n += 1
+                    self.reg_ack = (self._ack_n,
+                                    int(str(data.get("reg", "0")), 16),
+                                    int(str(data.get("val", "0")), 16),
+                                    int(str(data.get("rb", "0")), 16),
+                                    bool(data.get("ok")))
+                except ValueError:
+                    pass
             elif st == "sensor_preset":
                 try:
                     # Carry the probe's proof along: did the register writes
@@ -796,6 +833,8 @@ class ProbeLink:
                 "colour_mode": self.colour_mode,
                 "sensor_preset": self.sensor_preset,
                 "sensor_regs": self.sensor_regs,
+                "regs_seq": self.regs_seq,
+                "reg_ack": self.reg_ack,
                 "raw_stream": self.raw_stream,
                 "test_pattern": self.test_pattern,
                 "calib_ok": self.calib_ok,
@@ -831,6 +870,14 @@ class SimLink:
         self.colour_mode = 1
         self.sensor_preset = (0, "rgb565 driver default")
         self.sensor_regs = "14=10 22=57 24=a6 54=22 (sim)"
+        self._regs = {0x14: 0x10, 0x22: 0x57, 0x24: 0xa6, 0x03: 0x01, 0x04: 0xe8,
+                      0x50: 0x14, 0x5a: 0x56, 0x5b: 0x40, 0x5c: 0x4a, 0xb1: 0x40,
+                      0xb2: 0x40, 0xb3: 0x40, 0xb4: 0x80, 0xb5: 0x00}
+        self.regs_dict = dict(self._regs)
+        self.regs_seq = 1
+        self.defaults = dict(self._regs)
+        self.reg_ack = None
+        self._ack_n = 0
         self.calib_ok = True
         self.raw = None
         self.raw_seq = 0
@@ -870,6 +917,25 @@ class SimLink:
         qz = (math.cos(yaw / 2), 0.0, 0.0, math.sin(yaw / 2))
         qy = (math.cos(pitch / 2), 0.0, -math.sin(pitch / 2), 0.0)
         return q_mul(qz, qy)            # lens along +X, nose-up positive
+
+    def send_bytes(self, bs):
+        bs = bytes(bs)
+        if len(bs) == 3 and bs[0] == ord("W"):
+            with self.lock:
+                self._regs[bs[1]] = bs[2]
+                self._ack_n += 1
+                self.reg_ack = (self._ack_n, bs[1], bs[2], bs[2], True)
+            return True
+        if bs[:1] in (b"g", b"G"):
+            with self.lock:
+                self.regs_dict = dict(self._regs)
+                self.regs_seq += 1
+            return True
+        return self.send_byte(bs[0]) if bs else False
+
+    def get_regs(self):
+        with self.lock:
+            return dict(self.regs_dict), dict(self.defaults)
 
     def send_byte(self, b):
         if b in (ord("c"), ord("C")):
@@ -935,6 +1001,7 @@ class SimLink:
                     "fw_ver": self.fw_ver, "colour_mode": self.colour_mode,
                     "sensor_preset": self.sensor_preset,
                     "sensor_regs": self.sensor_regs,
+                    "regs_seq": self.regs_seq, "reg_ack": self.reg_ack,
                     "calib_ok": self.calib_ok, "raw_seq": self.raw_seq,
                     "camera_failed": False, "generation": self.generation,
                     "imu_age": now - self.imu_time if self.imu_time else 1e9,
@@ -1091,6 +1158,7 @@ class App:
     STAGE_SETUP = 0      # instructions, no indicator yet
     STAGE_CHECK = 1      # zeroed; verify before entering the live view
     STAGE_RUN = 2
+    STAGE_TUNE = 3       # manual sensor tuning: rows left, live picture right
 
     def __init__(self, link, args):
         self.link = link
@@ -1116,6 +1184,17 @@ class App:
         # button stays so a differently-mounted probe can undo it.
         self.el_sign = 1.0 if self.cfg.get("el_sign", -1) > 0 else -1.0
         self.awb = bool(self.cfg.get("awb", True))
+        self.tune_saved = self.cfg.get("tune")      # last DONE'd tuning, if any
+        self.tune = {"regs": {}, "cm": "0", "poke_reg": 0x93, "poke_val": 0x40}
+        self.tune_page = 0
+        self.tune_vals = {}
+        self.tune_video = None
+        self.tune_photo = None
+        self.tune_line = None
+        self.tune_box = (0, 0, 1, 1)
+        self._tune_pop_seq = -1
+        self._tune_ack_seq = 0
+        self._tune_gen_applied = -1
         self.swap_rb = bool(self.cfg.get("swap_rb", False))
         self._awb_gains = None
         self.diag_photo = None          # sticky DIAG grid, shown over video
@@ -1192,7 +1271,8 @@ class App:
                            "rot180": self.rot180,
                            "el_sign": self.el_sign,
                            "awb": self.awb,
-                           "swap_rb": self.swap_rb}, f)
+                           "swap_rb": self.swap_rb,
+                           "tune": self.tune_saved}, f)
         except Exception:
             pass
 
@@ -1325,6 +1405,8 @@ class App:
             self.enter_setup()
         elif stage == self.STAGE_CHECK:
             self.enter_check()
+        elif stage == self.STAGE_TUNE:
+            self.enter_tune()
         else:
             self.enter_run()
 
@@ -1549,9 +1631,9 @@ class App:
         self.button(pad, H - pad - int(H * 0.055) - int(H * 0.085), "DIAG",
                     "#4e5d3a", self.toggle_diag, max(10, int(H / 38)),
                     store=self.hud, anchor="sw")
-        self.button(pad, H - pad - int(H * 0.055) - int(H * 0.170), "SENSOR",
-                    "#5d4037", self.next_preset, max(10, int(H / 38)),
-                    store=self.hud, anchor="sw")
+        self.button(pad, H - pad - int(H * 0.055) - int(H * 0.170), "TUNE",
+                    "#5d4037", lambda: self.set_stage(self.STAGE_TUNE),
+                    max(10, int(H / 38)), store=self.hud, anchor="sw")
         # Sensor register dump from the last SENSOR press: lets the chip's
         # real state be read off a photograph of the screen.
         self.regs_item = self.canvas.create_text(
@@ -1713,6 +1795,10 @@ class App:
             self.toggle_diag()
         elif k == "n" and self.stage == self.STAGE_RUN:
             self.next_preset()
+        elif k == "t" and self.stage == self.STAGE_RUN:
+            self.set_stage(self.STAGE_TUNE)
+        elif k in ("return", "kp_enter") and self.stage == self.STAGE_TUNE:
+            self.tune_done()
         elif k == "p" and self.stage == self.STAGE_RUN:
             self.next_preset(back=True)
         elif k == "t" and self.stage == self.STAGE_RUN:
@@ -1803,6 +1889,20 @@ class App:
             self.q_ref = None
             self.notice = "PROBE RESTARTED \u2014 ZERO AGAIN"
             self.set_stage(self.STAGE_SETUP)
+            self.root.after(40, self.update)
+            return
+
+        # The sensor forgets everything on power-up. Whatever the operator
+        # DONE'd in TUNE is replayed on every new probe boot, once its own
+        # defaults dump has landed.
+        if (self.tune_saved and h.get("fw_ver") is not None
+                and h.get("fw_ver", (0, 0)) >= (3, 10)
+                and h["generation"] != self._tune_gen_applied):
+            self._tune_gen_applied = h["generation"]
+            self.root.after(1500, self._tune_apply_saved)
+
+        if self.stage == self.STAGE_TUNE:
+            self._tune_update(h, frame, seq)
             self.root.after(40, self.update)
             return
 
@@ -1978,6 +2078,337 @@ class App:
             self.canvas.itemconfigure(self.statusbar, text="    ".join(bits))
 
         self.root.after(40, self.update)
+
+
+    # ---- TUNE stage: every image-affecting knob, live, saved on DONE -------
+
+    TUNE_FORMATS = [("RGB565", 0xa6, "0"), ("YUV Y-Cb a2", 0xa2, "2"),
+                    ("YUV Y-Cr a3", 0xa3, "2"), ("YUV Cb-Y a0", 0xa0, "3"),
+                    ("YUV Cr-Y a1", 0xa1, "3")]
+    TUNE_FLIPS = [("none", 0x10), ("mirror", 0x11), ("flip", 0x12), ("both", 0x13)]
+    TUNE_REGS = [0x24, 0x22, 0x14, 0x03, 0x04, 0x50, 0x5a, 0x5b, 0x5c,
+                 0xb1, 0xb2, 0xb3, 0xb5]
+    # (key, label, kind, spec)
+    TUNE_PAGES = [
+        [("fmt",  "OUTPUT FORMAT",   "fmt",   None),
+         ("aec",  "AUTO EXPOSURE",   "bit",   0x01),
+         ("awb",  "AUTO WHITE BAL",  "bit",   0x02),
+         ("agc",  "AUTO GAIN",       "bit",   0x04),
+         ("r",    "WB GAIN  R",      "reg",   (0x5a, 4, 16, 0x02)),
+         ("g",    "WB GAIN  G",      "reg",   (0x5b, 4, 16, 0x02)),
+         ("b",    "WB GAIN  B",      "reg",   (0x5c, 4, 16, 0x02)),
+         ("satb", "SATURATION Cb",   "reg",   (0xb1, 4, 16, None)),
+         ("satr", "SATURATION Cr",   "reg",   (0xb2, 4, 16, None)),
+         ("con",  "CONTRAST",        "reg",   (0xb3, 4, 16, None)),
+         ("bri",  "BRIGHTNESS",      "sreg",  (0xb5, 4, 16, None))],
+        [("exp",  "EXPOSURE 03/04",  "reg16", (0x03, 0x04, 32, 256, 0x01)),
+         ("gain", "GLOBAL GAIN 50",  "reg",   (0x50, 4, 16, 0x04)),
+         ("flip", "FLIP / MIRROR",   "flip",  None),
+         ("rot",  "PI: ROTATE 180",  "pi",    "rot180"),
+         ("pawb", "PI: SOFT AWB",    "pi",    "awb"),
+         ("prb",  "PI: SWAP R/B",    "pi",    "swap_rb"),
+         ("preg", "POKE  REGISTER",  "poke_reg", None),
+         ("pval", "POKE  VALUE",     "poke_val", None)],
+    ]
+
+    def enter_tune(self):
+        c, W, H, z = self.canvas, self.W, self.H, self.stage_items
+        pw = int(W * 0.47)
+        pad = max(10, H // 46)
+        small = max(11, int(H / 44))
+        z.append(c.create_rectangle(0, 0, pw, H, fill="#0e161b", outline=""))
+        z.append(c.create_text(12, 10, anchor="nw", fill="white",
+                               text="TUNE   page {}/{}".format(
+                                   self.tune_page + 1, len(self.TUNE_PAGES)),
+                               font=self.f(small + 3, True)))
+        z.append(c.create_text(W - 8, 14, anchor="ne", fill=MUTED,
+                               text="adjust left \u00b7 watch right \u00b7 DONE saves \u00b7 screenshot the green line",
+                               font=self.f(small - 1)))
+
+        rows = self.TUNE_PAGES[self.tune_page]
+        y0, y1 = 48, H - 106
+        rh = min(46, (y1 - y0) // max(1, len(rows)))
+        bx = int(pw * 0.38)
+        bw = 34
+        self.tune_vals = {}
+        for i, (key, label, kind, spec) in enumerate(rows):
+            y = y0 + i * rh
+            z.append(c.create_text(12, y + rh / 2, anchor="w", text=label,
+                                   fill="#cfd8dc", font=self.f(small)))
+            x = bx
+            for lab, d in (("<<", -2), ("<", -1)):
+                self._tune_btn(x, y + 4, bw, rh - 8, lab,
+                               lambda k=key, d=d: self._tune_step(k, d))
+                x += bw + 4
+            self.tune_vals[key] = c.create_text(x + 70, y + rh / 2, text="?",
+                                                fill="white",
+                                                font=self.f(small, True))
+            z.append(self.tune_vals[key])
+            x += 140 + 4
+            for lab, d in ((">", 1), (">>", 2)):
+                self._tune_btn(x, y + 4, bw, rh - 8, lab,
+                               lambda k=key, d=d: self._tune_step(k, d))
+                x += bw + 4
+
+        # live picture, right side
+        bx0, by0 = pw + 8, 48
+        bx1, by1 = W - 8, H - 106
+        self.tune_box = (bx0, by0, bx1 - bx0, by1 - by0)
+        z.append(c.create_rectangle(bx0, by0, bx1, by1, outline=EDGE, width=1))
+        self.tune_video = c.create_image((bx0 + bx1) // 2, (by0 + by1) // 2)
+        z.append(self.tune_video)
+        self.tune_photo = None
+        self.last_seq = -1
+
+        # values line: the thing to screenshot
+        self.tune_line = c.create_text(12, H - 84, anchor="w", text="",
+                                       fill="#9ccc65", font=self.f(max(11, int(H / 46)), True))
+        z.append(self.tune_line)
+
+        bs = max(12, int(H / 34))
+        self.button(12, H - pad, "RESET", "#455a64", self.tune_reset, bs,
+                    store=z, anchor="sw")
+        self.button(12 + int(W * 0.13), H - pad, "PAGE", "#37474f",
+                    self.tune_next_page, bs, store=z, anchor="sw")
+        self.button(W - pad, H - pad, "DONE  \u2713", "#2e7d32", self.tune_done,
+                    bs, store=z, anchor="se")
+
+        self._tune_pop_seq = -1              # take the next dump
+        self.link.send_bytes(b"g")
+        self._tune_refresh()
+
+    def _tune_btn(self, x, y, w, h, label, cb):
+        c = self.canvas
+        r = c.create_rectangle(x, y, x + w, y + h, fill="#37474f", outline="")
+        t = c.create_text(x + w / 2, y + h / 2, text=label, fill="white",
+                          font=self.f(max(11, int(self.H / 44)), True))
+        for item in (r, t):
+            c.tag_bind(item, "<Button-1>", lambda e: cb())
+        self.stage_items.extend((r, t))
+
+    def tune_next_page(self):
+        self.tune_page = (self.tune_page + 1) % len(self.TUNE_PAGES)
+        self.set_stage(self.STAGE_TUNE)
+
+    # ---- values
+
+    def _reg(self, reg, default=0):
+        return self.tune["regs"].get(reg, default)
+
+    def _tune_write(self, reg, val):
+        val = max(0, min(255, int(val)))
+        self.tune["regs"][reg] = val
+        if not self.link.send_bytes(bytes([ord("W"), reg, val])):
+            self.toast("PROBE NOT CONNECTED", WARN)
+        self._tune_refresh()
+
+    def _tune_send_cm(self):
+        self.link.send_bytes(self.tune["cm"].encode())
+
+    def _tune_clear_auto(self, mask, what):
+        v = self._reg(0x22, 0x57)
+        if v & mask:
+            self._tune_write(0x22, v & ~mask)
+            self.toast("AUTO {} switched OFF for manual control".format(what),
+                       DIM, ms=1400)
+
+    def _tune_step(self, key, d):
+        rows = {k: (kind, spec) for page in self.TUNE_PAGES
+                for (k, _, kind, spec) in page}
+        kind, spec = rows[key]
+        sign = 1 if d > 0 else -1
+        big = abs(d) == 2
+        if kind == "fmt":
+            codes = [f[1] for f in self.TUNE_FORMATS]
+            cur = self._reg(0x24, 0xa6)
+            i = codes.index(cur) if cur in codes else 0
+            name, code, cm = self.TUNE_FORMATS[(i + sign) % len(codes)]
+            self.tune["cm"] = cm
+            self._tune_write(0x24, code)
+            self._tune_send_cm()
+        elif kind == "bit":
+            self._tune_write(0x22, self._reg(0x22, 0x57) ^ spec)
+        elif kind in ("reg", "sreg"):
+            reg, s, b, auto = spec
+            step = (b if big else s) * sign
+            cur = self._reg(reg, 0x40)
+            if kind == "sreg":
+                cur = cur - 256 if cur > 127 else cur
+                cur = max(-128, min(127, cur + step)) & 0xff
+            else:
+                cur = max(0, min(255, cur + step))
+            if auto:
+                self._tune_clear_auto(auto, {0x02: "WHITE BAL", 0x04: "GAIN",
+                                             0x01: "EXPOSURE"}[auto])
+            self._tune_write(reg, cur)
+        elif kind == "reg16":
+            hi, lo, s, b, auto = spec
+            cur = (self._reg(hi, 1) << 8) | self._reg(lo, 0xe8)
+            cur = max(1, min(4095, cur + (b if big else s) * sign))
+            if auto:
+                self._tune_clear_auto(auto, "EXPOSURE")
+            self.tune["regs"][hi] = cur >> 8
+            self._tune_write(hi, cur >> 8)
+            self._tune_write(lo, cur & 0xff)
+        elif kind == "flip":
+            codes = [f[1] for f in self.TUNE_FLIPS]
+            cur = self._reg(0x14, 0x10)
+            i = codes.index(cur) if cur in codes else 0
+            self._tune_write(0x14, codes[(i + sign) % len(codes)])
+        elif kind == "pi":
+            setattr(self, spec, not getattr(self, spec))
+            self.save_cfg()
+            self.last_seq = -1
+            self._tune_refresh()
+        elif kind == "poke_reg":
+            self.tune["poke_reg"] = (self.tune["poke_reg"]
+                                     + (16 if big else 1) * sign) & 0xff
+            self._tune_refresh()
+        elif kind == "poke_val":
+            self.tune["poke_val"] = (self.tune["poke_val"]
+                                     + (16 if big else 1) * sign) & 0xff
+            self._tune_write(self.tune["poke_reg"], self.tune["poke_val"])
+
+    def _tune_value_text(self, key, kind, spec):
+        if kind == "fmt":
+            cur = self._reg(0x24, None)
+            for name, code, _ in self.TUNE_FORMATS:
+                if code == cur:
+                    return name
+            return "0x%02X ?" % cur if cur is not None else "?"
+        if kind == "bit":
+            v = self._reg(0x22, None)
+            return "?" if v is None else ("ON" if v & spec else "OFF")
+        if kind == "reg":
+            v = self._reg(spec[0], None)
+            return "?" if v is None else "0x%02X  (%d)" % (v, v)
+        if kind == "sreg":
+            v = self._reg(spec[0], None)
+            if v is None:
+                return "?"
+            return "%+d" % (v - 256 if v > 127 else v)
+        if kind == "reg16":
+            hi, lo = self._reg(spec[0], None), self._reg(spec[1], None)
+            return "?" if hi is None or lo is None else str((hi << 8) | lo)
+        if kind == "flip":
+            cur = self._reg(0x14, None)
+            for name, code in self.TUNE_FLIPS:
+                if code == cur:
+                    return name
+            return "?"
+        if kind == "pi":
+            return "ON" if getattr(self, spec) else "OFF"
+        if kind == "poke_reg":
+            return "reg 0x%02X" % self.tune["poke_reg"]
+        if kind == "poke_val":
+            return "0x%02X" % self.tune["poke_val"]
+        return "?"
+
+    def _tune_values_line(self):
+        regs = " ".join("%02x=%02x" % (r, self._reg(r, 0))
+                        for r in self.TUNE_REGS if r in self.tune["regs"])
+        return "TUNE  {}  cm={}  |  pi rot={:d} awb={:d} rb={:d}".format(
+            regs or "(waiting for probe)", self.tune["cm"],
+            self.rot180, self.awb, self.swap_rb)
+
+    def _tune_refresh(self):
+        if self.stage != self.STAGE_TUNE:
+            return
+        for key, label, kind, spec in self.TUNE_PAGES[self.tune_page]:
+            item = self.tune_vals.get(key)
+            if item:
+                self.canvas.itemconfigure(item, text=self._tune_value_text(key, kind, spec))
+        if self.tune_line:
+            self.canvas.itemconfigure(self.tune_line, text=self._tune_values_line())
+
+    def _tune_from_dump(self, d):
+        for reg in self.TUNE_REGS:
+            if reg in d:
+                self.tune["regs"][reg] = d[reg]
+        fmt = self.tune["regs"].get(0x24)
+        for name, code, cm in self.TUNE_FORMATS:
+            if code == fmt:
+                self.tune["cm"] = cm
+        self._tune_refresh()
+
+    def _tune_update(self, h, frame, seq):
+        if h.get("regs_seq", 0) != self._tune_pop_seq:
+            self._tune_pop_seq = h.get("regs_seq", 0)
+            d, _ = self.link.get_regs()
+            if d:
+                self._tune_from_dump(d)
+        ack = h.get("reg_ack")
+        if ack and ack[0] != self._tune_ack_seq:
+            self._tune_ack_seq = ack[0]
+            if not ack[4]:
+                self.toast("REG 0x%02X WRITE FAILED (read back 0x%02X)"
+                           % (ack[1], ack[3]), WARN, ms=1800)
+        if frame is not None and seq != self.last_seq and self.tune_video:
+            self.last_seq = seq
+            img = cv2.rotate(frame, cv2.ROTATE_180) if self.rot180 else frame
+            fh, fw = img.shape[:2]
+            bw, bh = self.tune_box[2], self.tune_box[3]
+            scale = min(bw / fw, bh / fh)
+            small = cv2.resize(img, (max(1, int(fw * scale)), max(1, int(fh * scale))),
+                               interpolation=cv2.INTER_LINEAR)
+            if self.swap_rb:
+                small = small[:, :, ::-1].copy()
+            if self.awb:
+                small, self._awb_gains = grey_world(small, self._awb_gains)
+            rgb = cv2.cvtColor(small, cv2.COLOR_BGR2RGB)
+            self.tune_photo = ImageTk.PhotoImage(Image.fromarray(rgb))
+            self.canvas.itemconfigure(self.tune_video, image=self.tune_photo)
+
+    # ---- reset / apply / done
+
+    def tune_reset(self):
+        _, defaults = self.link.get_regs()
+        if not defaults:
+            self.toast("NO DEFAULTS FROM PROBE YET", WARN)
+            return
+        for reg in self.TUNE_REGS:
+            if reg in defaults and reg != 0x24:
+                self._tune_write(reg, defaults[reg])
+        if 0x24 in defaults:
+            self.tune["cm"] = "0" if defaults[0x24] == 0xa6 else "2"
+            self._tune_write(0x24, defaults[0x24])
+            self._tune_send_cm()
+        self.toast("SENSOR RESET TO DRIVER DEFAULTS", OK, ms=1600)
+
+    def _tune_apply_saved(self):
+        saved = self.tune_saved or {}
+        regs = saved.get("regs") or {}
+        order = ["22", "14", "03", "04", "50", "5a", "5b", "5c", "b1", "b2",
+                 "b3", "b5", "24"]
+        n = 0
+        for k in order:
+            if k in regs:
+                reg, val = int(k, 16), int(regs[k])
+                self.tune["regs"][reg] = val
+                self.link.send_bytes(bytes([ord("W"), reg, val]))
+                n += 1
+        if "cm" in saved:
+            self.tune["cm"] = str(saved["cm"])
+            self._tune_send_cm()
+        if n:
+            self.toast("TUNING RE-APPLIED TO PROBE ({} regs)".format(n), OK, ms=1600)
+        self._tune_refresh()
+
+    def tune_done(self):
+        """Leave TUNE: persist everything, replay on every future probe boot."""
+        self.tune_saved = {"regs": {"%02x" % r: self._reg(r, 0)
+                                    for r in self.TUNE_REGS if r in self.tune["regs"]},
+                           "cm": self.tune["cm"]}
+        self.save_cfg()
+        try:
+            with open(os.path.expanduser("~/endoscope_tune.txt"), "a",
+                      encoding="utf-8") as f:
+                f.write(time.strftime("%Y-%m-%d %H:%M:%S  ") + self._tune_values_line() + "\n")
+        except Exception:
+            pass
+        self._tune_gen_applied = self.link.health()["generation"]
+        self.set_stage(self.STAGE_RUN)
+        self.toast("TUNING SAVED \u2713", OK, ms=1600)
 
     def quit(self):
         if self.log:
