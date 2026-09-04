@@ -354,47 +354,120 @@ class AxisDetector:
 
 # ---------------------------------------------------- colour diagnostics
 
-def build_diag_grid(raw, width, height):
+def photo_score(bgr):
     """
-    Render one raw sensor frame under every plausible interpretation, side by
-    side with labels. The tile that looks like a photograph is the truth about
-    what the sensor streams; anything else is guesswork. If EVERY tile is
-    noise, the problem is not pixel interpretation at all but the parallel
-    data bus itself (pins / pixel clock), which is a different hunt.
+    How much does this look like a photograph rather than misread bytes?
+
+    Two properties survive in a correctly decoded image and collapse in an
+    incorrectly decoded one:
+
+      channel agreement  the three planes describe the same scene, so they
+                         correlate strongly. Reading the wrong bits puts
+                         different information in each plane.
+      spatial smoothness neighbouring pixels are similar. A wrong byte offset
+                         alternates between two unrelated values every pixel,
+                         which shows up as huge horizontal differences.
+
+    Scored on the horizontal axis specifically: byte-order faults in a packed
+    format misalign along the scan line, not down it, so a correct image and a
+    misread one differ far more left-to-right than top-to-bottom.
     """
+    a = bgr.astype(np.float32)
+    B, G, R = a[..., 0].ravel(), a[..., 1].ravel(), a[..., 2].ravel()
+
+    def cor(x, y):
+        x = x - x.mean(); y = y - y.mean()
+        d = math.sqrt(float((x * x).sum())) * math.sqrt(float((y * y).sum()))
+        return float((x * y).sum() / d) if d > 1e-6 else 0.0
+
+    agree = (cor(R, G) + cor(G, B) + cor(R, B)) / 3.0
+
+    grey = a.mean(2)
+    dh = np.abs(np.diff(grey, axis=1)).mean()
+    dv = np.abs(np.diff(grey, axis=0)).mean()
+    # Ratio, not absolute: a flat wall and a busy workshop then score alike.
+    smooth = 1.0 / (1.0 + dh / max(dv, 1e-3))
+
+    return 0.6 * agree + 0.4 * smooth, agree, dh, dv
+
+
+def interpretations(raw, width, height):
+    """Every plausible reading of one raw sensor frame, as BGR images."""
     if len(raw) < width * height * 2:
-        return None
+        return []
     buf = np.frombuffer(raw, dtype=np.uint8,
                         count=width * height * 2).reshape(height, width, 2)
 
     def rgb565(le):
-        w16 = (buf[:, :, 0].astype(np.uint16)
-               | (buf[:, :, 1].astype(np.uint16) << 8)) if le else               (buf[:, :, 1].astype(np.uint16)
-               | (buf[:, :, 0].astype(np.uint16) << 8))
-        r = ((w16 >> 11) & 0x1F).astype(np.uint8) << 3
-        g = ((w16 >> 5) & 0x3F).astype(np.uint8) << 2
-        b = (w16 & 0x1F).astype(np.uint8) << 3
-        return np.dstack([b, g, r])                       # BGR for cv2
+        w16 = ((buf[:, :, 0].astype(np.uint16) | (buf[:, :, 1].astype(np.uint16) << 8))
+               if le else
+               (buf[:, :, 1].astype(np.uint16) | (buf[:, :, 0].astype(np.uint16) << 8)))
+        r = (((w16 >> 11) & 0x1F).astype(np.uint16) * 527 + 23) >> 6
+        g = (((w16 >> 5) & 0x3F).astype(np.uint16) * 259 + 33) >> 6
+        b = ((w16 & 0x1F).astype(np.uint16) * 527 + 23) >> 6
+        return np.dstack([b, g, r]).astype(np.uint8)        # BGR for cv2
 
-    tiles = [("RGB565 = COLOR mode 0", rgb565(False)),
-             ("swapped = COLOR mode 1", rgb565(True)),
-             ("YUYV = COLOR mode 2", cv2.cvtColor(buf, cv2.COLOR_YUV2BGR_YUY2)),
-             ("YUV YVYU", cv2.cvtColor(buf, cv2.COLOR_YUV2BGR_YVYU)),
-             ("YUV UYVY", cv2.cvtColor(buf, cv2.COLOR_YUV2BGR_UYVY))]
+    return [("RGB565 hi-first = mode 0", 0, rgb565(False)),
+            ("RGB565 lo-first = mode 1", 1, rgb565(True)),
+            ("YUV YUYV = mode 2", 2, cv2.cvtColor(buf, cv2.COLOR_YUV2BGR_YUY2)),
+            ("YUV YVYU", None, cv2.cvtColor(buf, cv2.COLOR_YUV2BGR_YVYU)),
+            ("YUV UYVY", None, cv2.cvtColor(buf, cv2.COLOR_YUV2BGR_UYVY))]
 
-    label_h = 26
+
+def build_diag_grid(raw, width, height, save_dir=None):
+    """
+    Score every interpretation and lay them out with the numbers visible, so
+    the choice stops depending on anyone squinting at a screen. Returns
+    (grid image, best mode or None, report lines).
+
+    Also dumps the raw bytes: if the scores still disagree with what the eye
+    sees, that file settles it offline in one step instead of another round of
+    photograph-and-guess.
+    """
+    items = interpretations(raw, width, height)
+    if not items:
+        return None, None, []
+
+    scored = []
+    for name, mode, img in items:
+        sc, agree, dh, dv = photo_score(img)
+        scored.append((sc, agree, dh, dv, name, mode, img))
+
+    best = max(scored, key=lambda t: t[0])
+    report = ["raw frame: {} bytes, {}x{}".format(len(raw), width, height)]
+    for sc, agree, dh, dv, name, mode, _ in scored:
+        report.append("  {:26s} score {:.3f}  agree {:+.3f}  dH {:5.1f}  dV {:5.1f}{}"
+                      .format(name, sc, agree, dh, dv,
+                              "   <-- best" if name == best[4] else ""))
+
+    if save_dir:
+        try:
+            os.makedirs(save_dir, exist_ok=True)
+            with open(os.path.join(save_dir, "endoscope_raw.bin"), "wb") as f:
+                f.write(raw)
+            report.append("  raw bytes written to "
+                          + os.path.join(save_dir, "endoscope_raw.bin"))
+        except Exception as e:
+            report.append("  (could not save raw: {})".format(e))
+
+    label_h = 30
     th, tw = height + label_h, width
-    grid = np.full(((th) * 2, tw * 3, 3), 16, np.uint8)
-    for i, (name, img) in enumerate(tiles):
+    grid = np.full((th * 2, tw * 3, 3), 16, np.uint8)
+    for i, (sc, agree, dh, dv, name, mode, img) in enumerate(scored):
         r, c = divmod(i, 3)
         y, x = r * th, c * tw
         grid[y + label_h:y + th, x:x + tw] = img
-        cv2.putText(grid, name, (x + 8, y + 19),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.55, (240, 245, 250), 1)
-    cv2.putText(grid, "DIAG - photograph this",
-                (tw * 2 + 8, th + 19),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.55, (140, 220, 160), 1)
-    return grid
+        win = name == best[4]
+        cv2.putText(grid, "{} {:.2f}{}".format(name, sc, "  BEST" if win else ""),
+                    (x + 8, y + 21), cv2.FONT_HERSHEY_SIMPLEX, 0.5,
+                    (120, 255, 160) if win else (235, 240, 245), 1)
+        if win:
+            cv2.rectangle(grid, (x + 1, y + 1), (x + tw - 2, y + th - 2),
+                          (120, 255, 160), 2)
+    cv2.putText(grid, "auto-scored - no photo needed",
+                (tw * 2 + 8, th + 21), cv2.FONT_HERSHEY_SIMPLEX, 0.5,
+                (140, 220, 160), 1)
+    return grid, best[5], report
 
 
 # ------------------------------------------------------------- serial link
@@ -1662,11 +1735,23 @@ class App:
                         cm, names.get(cm, "?")), OK, ms=1600)
             if h.get("raw_seq", 0) != self._raw_seen:
                 raw, self._raw_seen = self.link.take_raw()
-                grid = build_diag_grid(raw, 320, 240) if raw else None
+                grid, best, report = (build_diag_grid(
+                    raw, 320, 240, save_dir=os.path.expanduser("~"))
+                    if raw else (None, None, []))
                 if grid is not None:
                     self.diag_photo = grid
-                    self.toast("DIAG grid \u2014 photograph the screen, "
-                               "press DIAG to leave", OK, ms=3000)
+                    for line in report:
+                        print(line)
+                    if best is not None and best != self.link.health().get(
+                            "colour_mode"):
+                        # The measurement decided; apply it rather than
+                        # asking anyone to interpret the picture.
+                        self.link.send_byte(ord('0') + best)
+                        self.toast("COLOUR MODE {} chosen automatically"
+                                   .format(best), OK, ms=3000)
+                    else:
+                        self.toast("DIAG scored \u2014 press DIAG to leave",
+                                   OK, ms=3000)
 
             show = self.diag_photo if self.diag_photo is not None else frame
             fresh = (self.diag_photo is not None) or (frame is not None
